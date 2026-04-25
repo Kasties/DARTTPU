@@ -54,6 +54,22 @@ def parse_args():
     parser.add_argument("--shard-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--body-model-dir",
+        default=None,
+        help=(
+            "Directory containing smplx/ and smplh/ body-model subfolders. "
+            "Defaults to config_files.data_paths.body_model_dir."
+        ),
+    )
+    parser.add_argument(
+        "--skip-body-models",
+        action="store_true",
+        help=(
+            "Patch smplx.build_layer with a dummy object. This is valid for "
+            "mp_seq_v2/hml3d exports that use precomputed joints and pelvis_delta."
+        ),
+    )
     parser.add_argument("--body-type", default="smplx", choices=["smplx", "smplh"])
     parser.add_argument("--weight-scheme", default="text_samp:0.")
     parser.add_argument("--prob-static", type=float, default=0.0)
@@ -96,6 +112,57 @@ def maybe_patch_text_embedding(dataset_name: str):
 
         hml3d_mod.load_and_freeze_clip = load_zero_clip
         hml3d_mod.encode_text = encode_zero_text
+
+
+def configure_body_model_dir(body_model_dir: str | None):
+    """Set and validate DART's body-model path before smpl_utils is imported."""
+    import config_files.data_paths as data_paths
+
+    resolved = Path(body_model_dir) if body_model_dir is not None else Path(data_paths.body_model_dir)
+    resolved = resolved.expanduser()
+    if not resolved.is_absolute():
+        resolved = Path.cwd() / resolved
+
+    expected = [
+        resolved / "smplx" / "SMPLX_MALE.npz",
+        resolved / "smplx" / "SMPLX_FEMALE.npz",
+    ]
+    missing = [path for path in expected if not path.exists()]
+    if missing:
+        missing_text = "\n".join(f"  - {path}" for path in missing)
+        raise FileNotFoundError(
+            "SMPL-X body model files were not found before importing DART's "
+            "dataset stack.\n"
+            f"Checked body_model_dir: {resolved}\n"
+            f"Missing:\n{missing_text}\n"
+            "Pass --body-model-dir pointing at the directory that contains "
+            "the smplx/ and smplh/ subfolders, for example:\n"
+            "  --body-model-dir ./data/smplx_lockedhead_20230207/models_lockedhead"
+        )
+
+    data_paths.body_model_dir = resolved
+    return resolved
+
+
+class _UnavailableBodyModel:
+    def to(self, *args, **kwargs):
+        return self
+
+    def eval(self):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError(
+            "A SMPL body model was called, but --skip-body-models was used. "
+            "Use mp_seq_v2/hml3d data with precomputed joints/pelvis_delta, "
+            "or rerun with --body-model-dir pointing to real SMPL files."
+        )
+
+
+def patch_body_model_loading():
+    import smplx
+
+    smplx.build_layer = lambda *args, **kwargs: _UnavailableBodyModel()
 
 
 def get_dataset_class(dataset_name: str):
@@ -237,6 +304,13 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    if args.skip_body_models:
+        patch_body_model_loading()
+        print("body model loading: skipped")
+    else:
+        body_model_dir = configure_body_model_dir(args.body_model_dir)
+        print(f"using body_model_dir: {body_model_dir}")
 
     if args.text_mode == "none":
         maybe_patch_text_embedding(args.dataset)
