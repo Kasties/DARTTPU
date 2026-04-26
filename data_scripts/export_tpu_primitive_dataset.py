@@ -26,7 +26,7 @@ import random
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -114,7 +114,7 @@ def maybe_patch_text_embedding(dataset_name: str):
         hml3d_mod.encode_text = encode_zero_text
 
 
-def configure_body_model_dir(body_model_dir: str | None):
+def configure_body_model_dir(body_model_dir: Optional[str]):
     """Set and validate DART's body-model path before smpl_utils is imported."""
     import config_files.data_paths as data_paths
 
@@ -281,7 +281,7 @@ def prepare_output_dir(out_dir: Path, overwrite: bool):
                 path.unlink()
 
 
-def optional_string(value: str | None):
+def optional_string(value: Optional[str]):
     if value is None:
         return None
     if value.lower() in {"", "none", "null"}:
