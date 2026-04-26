@@ -19,6 +19,8 @@ from jax_dart.data.primitive_shards import iter_vae_batches, load_metadata
 
 
 ArrayMap = Dict[str, np.ndarray]
+FORWARD_NAMES = ("mu", "logvar", "std", "latent", "future_pred")
+GRAD_NAMES = ("loss", "rec", "kl", "grad_history", "grad_future")
 
 
 def _parse_latent_dim(value: str) -> Tuple[int, int]:
@@ -248,6 +250,8 @@ def _config_from_args(args: argparse.Namespace, feature_dim: int) -> Dict[str, A
         "position_embedding": args.position_embedding,
         "normalize_before": bool(args.normalize_before),
         "seed": int(args.seed),
+        "weight_rec": float(args.weight_rec),
+        "weight_kl": float(args.weight_kl),
     }
 
 
@@ -316,6 +320,113 @@ def deterministic_jax_forward(jax_model, history_np: np.ndarray, future_np: np.n
     }
 
 
+def _torch_huber_loss(pred, target, delta: float = 1.0):
+    import torch
+
+    error = pred - target
+    abs_error = torch.abs(error)
+    quadratic = torch.clamp(abs_error, max=delta)
+    linear = abs_error - quadratic
+    return 0.5 * quadratic**2 + delta * linear
+
+
+def _torch_deterministic_parts(torch_model, history, future):
+    import torch
+
+    batch_size = future.shape[0]
+    x = torch.cat((history, future), dim=1)
+    x = torch_model.skel_embedding(x)
+    x = x.permute(1, 0, 2)
+    dist_tokens = torch.tile(
+        torch_model.global_motion_token[:, None, :],
+        (1, batch_size, 1),
+    )
+    xseq = torch.cat((dist_tokens, x), dim=0)
+    xseq = torch_model.query_pos_encoder(xseq)
+    dist = torch_model.encoder(xseq)[: dist_tokens.shape[0]]
+    dist = torch_model.encoder_latent_proj(dist)
+    mu = dist[: torch_model.latent_size]
+    logvar = torch.clamp(dist[torch_model.latent_size :], min=-10.0, max=10.0)
+    std = logvar.exp().pow(0.5)
+    latent = mu
+    future_pred = torch_model.decode(latent, history, nfuture=future.shape[1])
+    return future_pred, mu, logvar, std
+
+
+def deterministic_torch_loss_and_input_grads(
+    torch_model,
+    history_np: np.ndarray,
+    future_np: np.ndarray,
+    device: str,
+    weight_rec: float,
+    weight_kl: float,
+) -> ArrayMap:
+    import torch
+
+    torch_model.eval()
+    torch_model.zero_grad(set_to_none=True)
+    history = torch.from_numpy(history_np).to(device=device, dtype=torch.float32)
+    future = torch.from_numpy(future_np).to(device=device, dtype=torch.float32)
+    history.requires_grad_(True)
+    future.requires_grad_(True)
+
+    future_pred, mu, logvar, std = _torch_deterministic_parts(torch_model, history, future)
+    rec = torch.mean(_torch_huber_loss(future_pred, future))
+    kl = 0.5 * torch.mean(mu**2 + std**2 - 1.0 - logvar)
+    loss = weight_rec * rec + weight_kl * kl
+    loss.backward()
+
+    return {
+        "loss": _torch_numpy(loss).reshape(()),
+        "rec": _torch_numpy(rec).reshape(()),
+        "kl": _torch_numpy(kl).reshape(()),
+        "grad_history": _torch_numpy(history.grad),
+        "grad_future": _torch_numpy(future.grad),
+    }
+
+
+def deterministic_jax_loss_and_input_grads(
+    jax_model,
+    history_np: np.ndarray,
+    future_np: np.ndarray,
+    weight_rec: float,
+    weight_kl: float,
+) -> ArrayMap:
+    import jax
+    import jax.numpy as jnp
+
+    from jax_dart.models.mld_vae import vae_reconstruction_kl_loss
+
+    history = jnp.asarray(history_np, dtype=jnp.float32)
+    future = jnp.asarray(future_np, dtype=jnp.float32)
+
+    def loss_fn(history_value, future_value):
+        latent, dist = jax_model.encode(future_value, history_value, rng=None)
+        future_pred = jax_model.decode(latent, history_value, nfuture=future_value.shape[1])
+        loss, terms = vae_reconstruction_kl_loss(
+            future_pred,
+            future_value,
+            dist,
+            weight_rec=weight_rec,
+            weight_kl=weight_kl,
+        )
+        return loss, (terms["rec"], terms["kl"])
+
+    (loss, (rec, kl)), (grad_history, grad_future) = jax.value_and_grad(
+        loss_fn,
+        argnums=(0, 1),
+        has_aux=True,
+    )(history, future)
+
+    return {
+        "loss": np.asarray(jax.device_get(loss), dtype=np.float32).reshape(()),
+        "rec": np.asarray(jax.device_get(rec), dtype=np.float32).reshape(()),
+        "kl": np.asarray(jax.device_get(kl), dtype=np.float32).reshape(()),
+        "grad_history": np.asarray(jax.device_get(grad_history), dtype=np.float32),
+        "grad_future": np.asarray(jax.device_get(grad_future), dtype=np.float32),
+    }
+
+
 def compare_arrays(
     name: str,
     torch_value: np.ndarray,
@@ -350,6 +461,8 @@ def _save_snapshot(
     jax_outputs: Optional[ArrayMap],
     config: Dict[str, Any],
     torch_state: Optional[ArrayMap] = None,
+    torch_grad_outputs: Optional[ArrayMap] = None,
+    jax_grad_outputs: Optional[ArrayMap] = None,
 ) -> None:
     arrays = {
         "config_json": np.array(json.dumps(config, sort_keys=True)),
@@ -360,6 +473,12 @@ def _save_snapshot(
         arrays[f"torch_{key}"] = value
     if jax_outputs is not None:
         for key, value in jax_outputs.items():
+            arrays[f"jax_{key}"] = value
+    if torch_grad_outputs is not None:
+        for key, value in torch_grad_outputs.items():
+            arrays[f"torch_{key}"] = value
+    if jax_grad_outputs is not None:
+        for key, value in jax_grad_outputs.items():
             arrays[f"jax_{key}"] = value
     if torch_state is not None:
         arrays.update(_prefix_torch_state_np(torch_state))
@@ -394,6 +513,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normalize-before", action="store_true")
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-4)
+    parser.add_argument("--grad-atol", type=float, default=3e-3)
+    parser.add_argument("--grad-rtol", type=float, default=3e-3)
+    parser.add_argument("--weight-rec", type=float, default=1.0)
+    parser.add_argument("--weight-kl", type=float, default=1e-4)
+    parser.add_argument("--include-grads", action="store_true")
     parser.add_argument("--fail-on-mismatch", action="store_true")
     parser.add_argument("--out-npz", default=None, help="Optional path for saving snapshot/output arrays.")
     return parser.parse_args()
@@ -416,11 +540,45 @@ def _load_batch(root: str, batch_samples: int) -> Tuple[int, np.ndarray, np.ndar
 
 def _compare_outputs(torch_outputs: ArrayMap, jax_outputs: ArrayMap, atol: float, rtol: float) -> Dict[str, Any]:
     compared = {}
-    for name in ("mu", "logvar", "std", "latent", "future_pred"):
+    for name in FORWARD_NAMES:
         compared[name] = compare_arrays(
             name,
             torch_outputs[name],
             jax_outputs[name],
+            atol=atol,
+            rtol=rtol,
+        )
+    return compared
+
+
+def _load_torch_forward_outputs(snapshot: Dict[str, np.ndarray]) -> ArrayMap:
+    return {
+        name: snapshot[f"torch_{name}"].astype(np.float32, copy=False)
+        for name in FORWARD_NAMES
+    }
+
+
+def _load_torch_grad_outputs(snapshot: Dict[str, np.ndarray]) -> Optional[ArrayMap]:
+    if f"torch_{GRAD_NAMES[0]}" not in snapshot:
+        return None
+    return {
+        name: snapshot[f"torch_{name}"].astype(np.float32, copy=False)
+        for name in GRAD_NAMES
+    }
+
+
+def _compare_grad_outputs(
+    torch_grad_outputs: ArrayMap,
+    jax_grad_outputs: ArrayMap,
+    atol: float,
+    rtol: float,
+) -> Dict[str, Any]:
+    compared = {}
+    for name in GRAD_NAMES:
+        compared[name] = compare_arrays(
+            name,
+            torch_grad_outputs[name],
+            jax_grad_outputs[name],
             atol=atol,
             rtol=rtol,
         )
@@ -465,6 +623,16 @@ def run_torch_export(args: argparse.Namespace) -> None:
         load_torch_checkpoint(torch_model, args.checkpoint, torch_device)
 
     torch_outputs = deterministic_torch_forward(torch_model, history, future, torch_device)
+    torch_grad_outputs = None
+    if args.include_grads:
+        torch_grad_outputs = deterministic_torch_loss_and_input_grads(
+            torch_model,
+            history,
+            future,
+            torch_device,
+            weight_rec=args.weight_rec,
+            weight_kl=args.weight_kl,
+        )
     config = _config_from_args(args, feature_dim)
     _save_snapshot(
         out_npz,
@@ -474,6 +642,7 @@ def run_torch_export(args: argparse.Namespace) -> None:
         jax_outputs=None,
         config=config,
         torch_state=_collect_torch_state_np(torch_model),
+        torch_grad_outputs=torch_grad_outputs,
     )
 
     print("torch_device:", torch_device)
@@ -481,6 +650,9 @@ def run_torch_export(args: argparse.Namespace) -> None:
     print("future:", future.shape, future.dtype)
     for name, value in torch_outputs.items():
         print(f"torch_{name}:", value.shape, value.dtype, "finite=", bool(np.isfinite(value).all()))
+    if torch_grad_outputs is not None:
+        for name, value in torch_grad_outputs.items():
+            print(f"torch_{name}:", value.shape, value.dtype, "finite=", bool(np.isfinite(value).all()))
     print("wrote:", out_npz)
 
 
@@ -495,10 +667,10 @@ def run_jax_compare(args: argparse.Namespace) -> None:
     config = _load_config(snapshot)
     history = snapshot["history"].astype(np.float32, copy=False)
     future = snapshot["future"].astype(np.float32, copy=False)
-    torch_outputs = {
-        name: snapshot[f"torch_{name}"].astype(np.float32, copy=False)
-        for name in ("mu", "logvar", "std", "latent", "future_pred")
-    }
+    torch_outputs = _load_torch_forward_outputs(snapshot)
+    torch_grad_outputs = _load_torch_grad_outputs(snapshot)
+    if args.include_grads and torch_grad_outputs is None:
+        raise SystemExit(f"{snapshot_path} does not contain Torch gradient outputs.")
     torch_state = _load_torch_state_np(snapshot)
     if not torch_state:
         raise SystemExit(f"{snapshot_path} does not contain Torch state arrays.")
@@ -531,6 +703,22 @@ def run_jax_compare(args: argparse.Namespace) -> None:
     print("history:", history.shape, history.dtype)
     print("future:", future.shape, future.dtype)
     compared = _compare_outputs(torch_outputs, jax_outputs, args.atol, args.rtol)
+    compared_grads = {}
+    jax_grad_outputs = None
+    if args.include_grads or torch_grad_outputs is not None:
+        jax_grad_outputs = deterministic_jax_loss_and_input_grads(
+            jax_model,
+            history,
+            future,
+            weight_rec=float(config.get("weight_rec", args.weight_rec)),
+            weight_kl=float(config.get("weight_kl", args.weight_kl)),
+        )
+        compared_grads = _compare_grad_outputs(
+            torch_grad_outputs,
+            jax_grad_outputs,
+            atol=args.grad_atol,
+            rtol=args.grad_rtol,
+        )
 
     if args.out_npz is not None:
         _save_snapshot(
@@ -541,11 +729,14 @@ def run_jax_compare(args: argparse.Namespace) -> None:
             jax_outputs,
             config=config,
             torch_state=torch_state,
+            torch_grad_outputs=torch_grad_outputs,
+            jax_grad_outputs=jax_grad_outputs,
         )
         print("wrote:", args.out_npz)
 
     if args.fail_on_mismatch:
         _maybe_fail(compared)
+        _maybe_fail(compared_grads)
 
 
 def run_both(args: argparse.Namespace) -> None:
@@ -598,6 +789,24 @@ def run_both(args: argparse.Namespace) -> None:
 
     torch_outputs = deterministic_torch_forward(torch_model, history, future, torch_device)
     jax_outputs = deterministic_jax_forward(jax_model, history, future)
+    torch_grad_outputs = None
+    jax_grad_outputs = None
+    if args.include_grads:
+        torch_grad_outputs = deterministic_torch_loss_and_input_grads(
+            torch_model,
+            history,
+            future,
+            torch_device,
+            weight_rec=args.weight_rec,
+            weight_kl=args.weight_kl,
+        )
+        jax_grad_outputs = deterministic_jax_loss_and_input_grads(
+            jax_model,
+            history,
+            future,
+            weight_rec=args.weight_rec,
+            weight_kl=args.weight_kl,
+        )
 
     print("torch_device:", torch_device)
     print("jax_backend:", jax.default_backend())
@@ -605,6 +814,14 @@ def run_both(args: argparse.Namespace) -> None:
     print("history:", history.shape, history.dtype)
     print("future:", future.shape, future.dtype)
     compared = _compare_outputs(torch_outputs, jax_outputs, args.atol, args.rtol)
+    compared_grads = {}
+    if args.include_grads:
+        compared_grads = _compare_grad_outputs(
+            torch_grad_outputs,
+            jax_grad_outputs,
+            atol=args.grad_atol,
+            rtol=args.grad_rtol,
+        )
 
     if args.out_npz is not None:
         _save_snapshot(
@@ -615,11 +832,14 @@ def run_both(args: argparse.Namespace) -> None:
             jax_outputs,
             config=_config_from_args(args, feature_dim),
             torch_state=_collect_torch_state_np(torch_model),
+            torch_grad_outputs=torch_grad_outputs,
+            jax_grad_outputs=jax_grad_outputs,
         )
         print("wrote:", args.out_npz)
 
     if args.fail_on_mismatch:
         _maybe_fail(compared)
+        _maybe_fail(compared_grads)
 
 
 def main() -> None:
