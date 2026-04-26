@@ -71,7 +71,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--body-type", default="smplx", choices=["smplx", "smplh"])
-    parser.add_argument("--weight-scheme", default="text_samp:0.")
+    parser.add_argument("--weight-scheme", default="uniform")
     parser.add_argument("--prob-static", type=float, default=0.0)
     parser.add_argument("--text-tolerance", type=float, default=0.0)
     parser.add_argument("--enforce-gender", default="male")
