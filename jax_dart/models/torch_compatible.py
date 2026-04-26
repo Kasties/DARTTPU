@@ -36,7 +36,7 @@ class TorchLinear(nnx.Module):
         self.bias = nnx.Param(_uniform(rngs.params(), (out_features,), bound))
 
     def __call__(self, x):
-        return jnp.matmul(x, jnp.swapaxes(self.weight.value, -1, -2)) + self.bias.value
+        return jnp.matmul(x, jnp.swapaxes(self.weight[...], -1, -2)) + self.bias[...]
 
 
 class TorchLayerNorm(nnx.Module):
@@ -51,7 +51,7 @@ class TorchLayerNorm(nnx.Module):
         mean = jnp.mean(x, axis=-1, keepdims=True)
         var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
         x = (x - mean) * jax.lax.rsqrt(var + self.eps)
-        return x * self.weight.value + self.bias.value
+        return x * self.weight[...] + self.bias[...]
 
 
 class TorchMultiheadAttention(nnx.Module):
@@ -73,8 +73,8 @@ class TorchMultiheadAttention(nnx.Module):
         self.out_proj_bias = nnx.Param(jnp.zeros((embed_dim,), dtype=jnp.float32))
 
     def _project_qkv(self, query, key, value):
-        q_weight, k_weight, v_weight = jnp.split(self.in_proj_weight.value, 3, axis=0)
-        q_bias, k_bias, v_bias = jnp.split(self.in_proj_bias.value, 3, axis=0)
+        q_weight, k_weight, v_weight = jnp.split(self.in_proj_weight[...], 3, axis=0)
+        q_bias, k_bias, v_bias = jnp.split(self.in_proj_bias[...], 3, axis=0)
         q = jnp.matmul(query, q_weight.T) + q_bias
         k = jnp.matmul(key, k_weight.T) + k_bias
         v = jnp.matmul(value, v_weight.T) + v_bias
@@ -101,7 +101,6 @@ class TorchMultiheadAttention(nnx.Module):
         attended = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
         attended = self._merge_heads(attended)
         return (
-            jnp.matmul(attended, self.out_proj_weight.value.T)
-            + self.out_proj_bias.value
+            jnp.matmul(attended, self.out_proj_weight[...].T)
+            + self.out_proj_bias[...]
         )
-

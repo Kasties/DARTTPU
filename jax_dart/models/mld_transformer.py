@@ -13,11 +13,15 @@ from .torch_compatible import (
 )
 
 
+def _gelu_exact(x):
+    return 0.5 * x * (1.0 + jax.lax.erf(x / jnp.sqrt(2.0)))
+
+
 def _activation(name: str):
     if name == "relu":
         return jax.nn.relu
     if name == "gelu":
-        return jax.nn.gelu
+        return _gelu_exact
     if name == "glu":
         return jax.nn.glu
     raise ValueError(f"Unsupported activation {name}.")
@@ -30,7 +34,7 @@ class LearnedPositionEncoding1D(nnx.Module):
         self.pe = nnx.Param(jax.random.uniform(rngs.params(), (max_len, 1, d_model)))
 
     def __call__(self, x):
-        return x + self.pe.value[: x.shape[1], 0, :][None, :, :]
+        return x + self.pe[: x.shape[1], 0, :][None, :, :]
 
 
 class SinePositionEncoding1D(nnx.Module):
@@ -46,7 +50,7 @@ class SinePositionEncoding1D(nnx.Module):
         self.pe = nnx.Variable(pe)
 
     def __call__(self, x):
-        return x + self.pe.value[: x.shape[1]][None, :, :]
+        return x + self.pe[: x.shape[1]][None, :, :]
 
 
 def build_position_encoding(d_model: int, position_embedding: str, *, rngs: nnx.Rngs):

@@ -138,7 +138,7 @@ class AutoMldVae(nnx.Module):
         x = jnp.concatenate((history_motion, future_motion), axis=1)
         x = self.skel_embedding(x)
         dist_tokens = jnp.broadcast_to(
-            self.global_motion_token.value[None, :, :],
+            self.global_motion_token[None, :, :],
             (batch_size, self.latent_size * 2, self.h_dim),
         )
         xseq = jnp.concatenate((dist_tokens, x), axis=1)
@@ -154,13 +154,13 @@ class AutoMldVae(nnx.Module):
         else:
             latent = mu + std * jax.random.normal(rng, mu.shape)
         if scale_latent:
-            latent = latent / self.latent_std.value
+            latent = latent / self.latent_std[...]
         return latent, NormalParams(loc=mu, scale=std, logvar=logvar)
 
     def decode(self, z, history_motion, nfuture: int, scale_latent: bool = False):
         batch_size = history_motion.shape[0]
         if scale_latent:
-            z = z * self.latent_std.value
+            z = z * self.latent_std[...]
         z = self.decoder_latent_proj(z)
         z = jnp.swapaxes(z, 0, 1)
         queries = jnp.zeros((batch_size, nfuture, self.h_dim), dtype=history_motion.dtype)
@@ -251,4 +251,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

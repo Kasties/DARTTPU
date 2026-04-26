@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -68,7 +68,7 @@ def split_motion_to_vae(
 
 def iter_vae_batches(
     root: str,
-    batch_samples: int | None = None,
+    batch_samples: Optional[int] = None,
 ) -> Iterator[ArrayDict]:
     """Yield VAE-ready batches from all shards.
 
@@ -129,7 +129,7 @@ def _jax_dtype(name: str):
     raise ValueError(f"Unsupported dtype {name}.")
 
 
-def smoke_test(root: str, batch_samples: int | None = None, dtype: str = "bf16"):
+def smoke_test(root: str, batch_samples: Optional[int] = None, dtype: str = "bf16"):
     import jax
     import jax.numpy as jnp
 
@@ -175,4 +175,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
