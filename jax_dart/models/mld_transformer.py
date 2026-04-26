@@ -132,12 +132,12 @@ class SkipTransformerEncoder(nnx.Module):
                 rngs=rngs,
             )
 
-        self.input_blocks = [make_layer() for _ in range(num_block)]
+        self.input_blocks = nnx.List([make_layer() for _ in range(num_block)])
         self.middle_block = make_layer()
-        self.output_blocks = [make_layer() for _ in range(num_block)]
-        self.linear_blocks = [
-            TorchLinear(2 * d_model, d_model, rngs=rngs) for _ in range(num_block)
-        ]
+        self.output_blocks = nnx.List([make_layer() for _ in range(num_block)])
+        self.linear_blocks = nnx.List(
+            [TorchLinear(2 * d_model, d_model, rngs=rngs) for _ in range(num_block)]
+        )
         self.norm = TorchLayerNorm(d_model, rngs=rngs)
 
     def __call__(self, src, pos=None):
@@ -247,12 +247,12 @@ class SkipTransformerDecoder(nnx.Module):
                 rngs=rngs,
             )
 
-        self.input_blocks = [make_layer() for _ in range(num_block)]
+        self.input_blocks = nnx.List([make_layer() for _ in range(num_block)])
         self.middle_block = make_layer()
-        self.output_blocks = [make_layer() for _ in range(num_block)]
-        self.linear_blocks = [
-            TorchLinear(2 * d_model, d_model, rngs=rngs) for _ in range(num_block)
-        ]
+        self.output_blocks = nnx.List([make_layer() for _ in range(num_block)])
+        self.linear_blocks = nnx.List(
+            [TorchLinear(2 * d_model, d_model, rngs=rngs) for _ in range(num_block)]
+        )
         self.norm = TorchLayerNorm(d_model, rngs=rngs)
 
     def __call__(self, tgt, memory, pos=None, query_pos=None):
@@ -270,4 +270,3 @@ class SkipTransformerDecoder(nnx.Module):
             x = module(x, memory, pos=pos, query_pos=query_pos)
 
         return self.norm(x)
-
