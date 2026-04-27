@@ -636,8 +636,8 @@ def deterministic_torch_loss_and_input_grads(
     kl = 0.5 * torch.mean(mu**2 + std**2 - 1.0 - logvar)
     loss = weight_rec * rec + weight_kl * kl
     temporal_terms = {}
-    if feature_slices is not None:
-        if norm_mean_np is None or norm_std_np is None or temporal_weights is None:
+    if temporal_weights is not None:
+        if feature_slices is None or norm_mean_np is None or norm_std_np is None:
             raise ValueError("Temporal SMPL loss requires feature slices, normalization, and weights.")
         temporal_terms = _torch_temporal_smpl_feature_loss(
             history,
@@ -723,8 +723,8 @@ def deterministic_jax_loss_and_input_grads(
             weight_kl=weight_kl,
         )
         aux_terms = {"rec": terms["rec"], "kl": terms["kl"]}
-        if feature_slices is not None:
-            if norm_mean is None or norm_std is None or temporal_weights is None:
+        if temporal_weights is not None:
+            if feature_slices is None or norm_mean is None or norm_std is None:
                 raise ValueError("Temporal SMPL loss requires feature slices, normalization, and weights.")
             temporal_loss, temporal_terms = temporal_smpl_feature_loss(
                 history_value,
