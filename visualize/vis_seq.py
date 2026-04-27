@@ -26,7 +26,7 @@ def numpy_motion_to_torch(primitive_data, device):
     """Accept NumPy sequence exports in addition to Torch-generated pickles."""
     for key in ('transl', 'poses_6d', 'joints', 'betas'):
         value = primitive_data.get(key)
-        if isinstance(value, np.ndarray):
+        if isinstance(value, (np.ndarray, list, tuple)):
             primitive_data[key] = torch.as_tensor(value, device=device, dtype=torch.float32)
     return primitive_data
 

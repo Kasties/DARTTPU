@@ -135,7 +135,22 @@ def _primitive_record(
 def _write_pkl(path: Path, value: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
-        pickle.dump(value, f)
+        pickle.dump(_pickle_safe(value), f)
+
+
+def _pickle_safe(value):
+    """Avoid NumPy 2 pickle module paths so older DART envs can load exports."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _pickle_safe(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_pickle_safe(item) for item in value)
+    if isinstance(value, list):
+        return [_pickle_safe(item) for item in value]
+    return value
 
 
 def parse_args() -> argparse.Namespace:
