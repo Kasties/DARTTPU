@@ -15,6 +15,10 @@ import numpy as np
 
 from jax_dart.data.primitive_shards import iter_vae_batches, load_metadata
 from jax_dart.models.mld_vae import AutoMldVae, vae_reconstruction_kl_loss
+from jax_dart.models.temporal_smpl_loss import (
+    load_motion_normalization,
+    temporal_smpl_feature_loss,
+)
 
 
 def _parse_latent_dim(value: str) -> Tuple[int, int]:
@@ -111,6 +115,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--weight-rec", type=float, default=1.0)
     parser.add_argument("--weight-kl", type=float, default=1e-4)
+    parser.add_argument("--weight-joints-delta", type=float, default=0.0)
+    parser.add_argument("--weight-transl-delta", type=float, default=0.0)
+    parser.add_argument("--weight-orient-delta", type=float, default=0.0)
     parser.add_argument("--h-dim", type=int, default=256)
     parser.add_argument("--ff-size", type=int, default=1024)
     parser.add_argument("--num-layers", type=int, default=7)
@@ -142,6 +149,10 @@ def main() -> None:
     args = parse_args()
     metadata = load_metadata(args.root)
     feature_dim = int(metadata["primitive"]["feature_dim"])
+    feature_slices = metadata["primitive"]["feature_slices"]
+    norm_mean_np, norm_std_np = load_motion_normalization(args.root)
+    norm_mean = jnp.asarray(norm_mean_np, dtype=jnp.float32)
+    norm_std = jnp.asarray(norm_std_np, dtype=jnp.float32)
     dtype = _jax_dtype(args.dtype)
 
     model = _make_model(args, feature_dim)
@@ -159,7 +170,26 @@ def main() -> None:
             weight_rec=args.weight_rec,
             weight_kl=args.weight_kl,
         )
-        return loss, terms["rec"], terms["kl"]
+        temporal_loss, temporal_terms = temporal_smpl_feature_loss(
+            history,
+            future_pred,
+            feature_slices=feature_slices,
+            norm_mean=norm_mean,
+            norm_std=norm_std,
+            weight_joints_delta=args.weight_joints_delta,
+            weight_transl_delta=args.weight_transl_delta,
+            weight_orient_delta=args.weight_orient_delta,
+        )
+        loss = loss + temporal_loss
+        return (
+            loss,
+            terms["rec"],
+            terms["kl"],
+            temporal_terms["joints_delta"],
+            temporal_terms["transl_delta"],
+            temporal_terms["orient_delta"],
+            temporal_terms["temporal_smpl"],
+        )
 
     @nnx.jit
     def train_step(model, optimizer, history, future):
@@ -173,18 +203,44 @@ def main() -> None:
                 weight_rec=args.weight_rec,
                 weight_kl=args.weight_kl,
             )
-            return loss, (terms["rec"], terms["kl"])
+            temporal_loss, temporal_terms = temporal_smpl_feature_loss(
+                history,
+                future_pred,
+                feature_slices=feature_slices,
+                norm_mean=norm_mean,
+                norm_std=norm_std,
+                weight_joints_delta=args.weight_joints_delta,
+                weight_transl_delta=args.weight_transl_delta,
+                weight_orient_delta=args.weight_orient_delta,
+            )
+            loss = loss + temporal_loss
+            return loss, (
+                terms["rec"],
+                terms["kl"],
+                temporal_terms["joints_delta"],
+                temporal_terms["transl_delta"],
+                temporal_terms["orient_delta"],
+                temporal_terms["temporal_smpl"],
+            )
 
-        (loss, (rec, kl)), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+        (loss, terms), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
         optimizer.update(model, grads)
-        return loss, rec, kl
+        return (loss, *terms)
 
     batches = _cycle_vae_batches(args.root, args.batch_samples)
     first_batch = next(batches)
     first_history = jnp.asarray(first_batch["history"], dtype=dtype)
     first_future = jnp.asarray(first_batch["future"], dtype=dtype)
 
-    initial_loss, initial_rec, initial_kl = eval_step(model, first_history, first_future)
+    (
+        initial_loss,
+        initial_rec,
+        initial_kl,
+        initial_joints_delta,
+        initial_transl_delta,
+        initial_orient_delta,
+        initial_temporal_smpl,
+    ) = eval_step(model, first_history, first_future)
     print("backend:", jax.default_backend())
     print("devices:", jax.devices())
     print("metadata_format:", metadata["format"])
@@ -193,6 +249,10 @@ def main() -> None:
     print("initial_loss:", initial_loss)
     print("initial_rec:", initial_rec)
     print("initial_kl:", initial_kl)
+    print("initial_joints_delta:", initial_joints_delta)
+    print("initial_transl_delta:", initial_transl_delta)
+    print("initial_orient_delta:", initial_orient_delta)
+    print("initial_temporal_smpl:", initial_temporal_smpl)
     _assert_finite("initial_loss", initial_loss, args.fail_on_nonfinite)
 
     for step in range(1, args.steps + 1):
@@ -202,16 +262,38 @@ def main() -> None:
             batch = next(batches)
         history = jnp.asarray(batch["history"], dtype=dtype)
         future = jnp.asarray(batch["future"], dtype=dtype)
-        loss, rec, kl = train_step(model, optimizer, history, future)
+        loss, rec, kl, joints_delta, transl_delta, orient_delta, temporal_smpl = train_step(
+            model,
+            optimizer,
+            history,
+            future,
+        )
         _assert_finite("loss", loss, args.fail_on_nonfinite)
         if step == 1 or step == args.steps or step % args.log_every == 0:
-            print(f"step={step} loss={loss} rec={rec} kl={kl}")
+            print(
+                f"step={step} loss={loss} rec={rec} kl={kl} "
+                f"temporal_smpl={temporal_smpl} "
+                f"joints_delta={joints_delta} transl_delta={transl_delta} "
+                f"orient_delta={orient_delta}"
+            )
 
-    final_loss, final_rec, final_kl = eval_step(model, first_history, first_future)
+    (
+        final_loss,
+        final_rec,
+        final_kl,
+        final_joints_delta,
+        final_transl_delta,
+        final_orient_delta,
+        final_temporal_smpl,
+    ) = eval_step(model, first_history, first_future)
     _assert_finite("final_loss", final_loss, args.fail_on_nonfinite)
     print("final_loss_on_first_batch:", final_loss)
     print("final_rec_on_first_batch:", final_rec)
     print("final_kl_on_first_batch:", final_kl)
+    print("final_joints_delta_on_first_batch:", final_joints_delta)
+    print("final_transl_delta_on_first_batch:", final_transl_delta)
+    print("final_orient_delta_on_first_batch:", final_orient_delta)
+    print("final_temporal_smpl_on_first_batch:", final_temporal_smpl)
     print("loss_delta_on_first_batch:", final_loss - initial_loss)
     print("optimizer_step:", optimizer.step[...])
 

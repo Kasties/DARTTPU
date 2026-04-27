@@ -17,6 +17,10 @@ from jax_dart.models.mld_vae_state import (
     save_vae_npz_checkpoint,
     state_from_npz,
 )
+from jax_dart.models.temporal_smpl_loss import (
+    load_motion_normalization,
+    temporal_smpl_feature_loss,
+)
 
 
 def _parse_latent_dim(value: str) -> Tuple[int, int]:
@@ -91,12 +95,16 @@ def _config_dict(args: argparse.Namespace, metadata: dict, feature_dim: int) -> 
         "source_format": metadata.get("format"),
         "root": args.root,
         "feature_dim": int(feature_dim),
+        "feature_slices": metadata["primitive"].get("feature_slices"),
         "batch_samples": int(args.batch_samples),
         "dtype": args.dtype,
         "learning_rate": float(args.learning_rate),
         "weight_decay": float(args.weight_decay),
         "weight_rec": float(args.weight_rec),
         "weight_kl": float(args.weight_kl),
+        "weight_joints_delta": float(args.weight_joints_delta),
+        "weight_transl_delta": float(args.weight_transl_delta),
+        "weight_orient_delta": float(args.weight_orient_delta),
         "latent_dim": [int(args.latent_dim[0]), int(args.latent_dim[1])],
         "h_dim": int(args.h_dim),
         "ff_size": int(args.ff_size),
@@ -128,6 +136,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--weight-rec", type=float, default=1.0)
     parser.add_argument("--weight-kl", type=float, default=1e-4)
+    parser.add_argument("--weight-joints-delta", type=float, default=0.0)
+    parser.add_argument("--weight-transl-delta", type=float, default=0.0)
+    parser.add_argument("--weight-orient-delta", type=float, default=0.0)
     parser.add_argument("--h-dim", type=int, default=256)
     parser.add_argument("--ff-size", type=int, default=1024)
     parser.add_argument("--num-layers", type=int, default=7)
@@ -175,6 +186,10 @@ def main() -> None:
 
     metadata = load_metadata(args.root)
     feature_dim = int(metadata["primitive"]["feature_dim"])
+    feature_slices = metadata["primitive"]["feature_slices"]
+    norm_mean_np, norm_std_np = load_motion_normalization(args.root)
+    norm_mean = jnp.asarray(norm_mean_np, dtype=jnp.float32)
+    norm_std = jnp.asarray(norm_std_np, dtype=jnp.float32)
     dtype = _jax_dtype(args.dtype)
     config = _config_dict(args, metadata, feature_dim)
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
@@ -195,11 +210,29 @@ def main() -> None:
                 weight_rec=args.weight_rec,
                 weight_kl=args.weight_kl,
             )
-            return loss, (terms["rec"], terms["kl"])
+            temporal_loss, temporal_terms = temporal_smpl_feature_loss(
+                history,
+                future_pred,
+                feature_slices=feature_slices,
+                norm_mean=norm_mean,
+                norm_std=norm_std,
+                weight_joints_delta=args.weight_joints_delta,
+                weight_transl_delta=args.weight_transl_delta,
+                weight_orient_delta=args.weight_orient_delta,
+            )
+            loss = loss + temporal_loss
+            return loss, (
+                terms["rec"],
+                terms["kl"],
+                temporal_terms["joints_delta"],
+                temporal_terms["transl_delta"],
+                temporal_terms["orient_delta"],
+                temporal_terms["temporal_smpl"],
+            )
 
-        (loss, (rec, kl)), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+        (loss, terms), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
         optimizer.update(model, grads)
-        return loss, rec, kl
+        return (loss, *terms)
 
     @nnx.jit
     def eval_step(model, history, future):
@@ -212,33 +245,65 @@ def main() -> None:
             weight_rec=args.weight_rec,
             weight_kl=args.weight_kl,
         )
-        return loss, terms["rec"], terms["kl"]
+        temporal_loss, temporal_terms = temporal_smpl_feature_loss(
+            history,
+            future_pred,
+            feature_slices=feature_slices,
+            norm_mean=norm_mean,
+            norm_std=norm_std,
+            weight_joints_delta=args.weight_joints_delta,
+            weight_transl_delta=args.weight_transl_delta,
+            weight_orient_delta=args.weight_orient_delta,
+        )
+        loss = loss + temporal_loss
+        return (
+            loss,
+            terms["rec"],
+            terms["kl"],
+            temporal_terms["joints_delta"],
+            temporal_terms["transl_delta"],
+            temporal_terms["orient_delta"],
+            temporal_terms["temporal_smpl"],
+        )
 
     def run_eval(step: int) -> Dict[str, float]:
         losses = []
         recs = []
         kls = []
+        joints_deltas = []
+        transl_deltas = []
+        orient_deltas = []
+        temporal_smpls = []
         for index, batch in enumerate(iter_vae_batches(args.root, batch_samples=args.batch_samples)):
             if index >= args.eval_batches:
                 break
             history = jnp.asarray(batch["history"], dtype=dtype)
             future = jnp.asarray(batch["future"], dtype=dtype)
-            loss, rec, kl = eval_step(model, history, future)
+            loss, rec, kl, joints_delta, transl_delta, orient_delta, temporal_smpl = eval_step(model, history, future)
             losses.append(_to_float(loss))
             recs.append(_to_float(rec))
             kls.append(_to_float(kl))
+            joints_deltas.append(_to_float(joints_delta))
+            transl_deltas.append(_to_float(transl_delta))
+            orient_deltas.append(_to_float(orient_delta))
+            temporal_smpls.append(_to_float(temporal_smpl))
         row = {
             "step": int(step),
             "split": "eval",
             "loss": float(np.mean(losses)),
             "rec": float(np.mean(recs)),
             "kl": float(np.mean(kls)),
+            "joints_delta": float(np.mean(joints_deltas)),
+            "transl_delta": float(np.mean(transl_deltas)),
+            "orient_delta": float(np.mean(orient_deltas)),
+            "temporal_smpl": float(np.mean(temporal_smpls)),
             "time": time.time(),
         }
         _write_metrics(metrics_path, row)
         print(
             f"eval step={step} loss={row['loss']:.6f} "
-            f"rec={row['rec']:.6f} kl={row['kl']:.6f}"
+            f"rec={row['rec']:.6f} kl={row['kl']:.6f} "
+            f"temporal_smpl={row['temporal_smpl']:.6f}"
         )
         return row
 
@@ -256,7 +321,12 @@ def main() -> None:
         batch = next(batches)
         history = jnp.asarray(batch["history"], dtype=dtype)
         future = jnp.asarray(batch["future"], dtype=dtype)
-        loss, rec, kl = train_step(model, optimizer, history, future)
+        loss, rec, kl, joints_delta, transl_delta, orient_delta, temporal_smpl = train_step(
+            model,
+            optimizer,
+            history,
+            future,
+        )
         _assert_finite("loss", loss, args.fail_on_nonfinite)
 
         if step == 1 or step == args.steps or step % args.log_every == 0:
@@ -267,6 +337,10 @@ def main() -> None:
                 "loss": _to_float(loss),
                 "rec": _to_float(rec),
                 "kl": _to_float(kl),
+                "joints_delta": _to_float(joints_delta),
+                "transl_delta": _to_float(transl_delta),
+                "orient_delta": _to_float(orient_delta),
+                "temporal_smpl": _to_float(temporal_smpl),
                 "elapsed_sec": float(elapsed),
                 "time": time.time(),
             }
@@ -275,6 +349,7 @@ def main() -> None:
             print(
                 f"train step={step} loss={row['loss']:.6f} "
                 f"rec={row['rec']:.6f} kl={row['kl']:.6f} "
+                f"temporal_smpl={row['temporal_smpl']:.6f} "
                 f"elapsed={elapsed:.1f}s"
             )
 
