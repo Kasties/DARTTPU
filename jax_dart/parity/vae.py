@@ -1205,6 +1205,8 @@ def run_torch_export(args: argparse.Namespace) -> None:
         print(f"torch_{name}:", value.shape, value.dtype, "finite=", bool(np.isfinite(value).all()))
     if torch_grad_outputs is not None:
         for name, value in torch_grad_outputs.items():
+            if name in torch_outputs:
+                continue
             print(f"torch_{name}:", value.shape, value.dtype, "finite=", bool(np.isfinite(value).all()))
     print("wrote:", out_npz)
 

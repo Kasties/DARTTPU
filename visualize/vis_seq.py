@@ -22,6 +22,15 @@ from config_files.data_paths import *
 from utils.smpl_utils import *
 
 
+def numpy_motion_to_torch(primitive_data, device):
+    """Accept NumPy sequence exports in addition to Torch-generated pickles."""
+    for key in ('transl', 'poses_6d', 'joints', 'betas'):
+        value = primitive_data.get(key)
+        if isinstance(value, np.ndarray):
+            primitive_data[key] = torch.as_tensor(value, device=device, dtype=torch.float32)
+    return primitive_data
+
+
 # https://stackoverflow.com/a/20865751/14532053
 class _Getch:
     """Gets a single character from standard input.  Does not echo to the screen."""
@@ -150,6 +159,7 @@ up=np.array([0, 0.0, 1.0])
 def vis_primitive_list(primitive_data_list, args):
     num_sequences = len(primitive_data_list)
     for primitive_data in primitive_data_list:
+        numpy_motion_to_torch(primitive_data, device)
         tensor_dict_to_device(primitive_data, device)
     primitive_data = primitive_data_list[0]
     scene = pyrender.Scene()
