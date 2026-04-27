@@ -15,6 +15,7 @@ import numpy as np
 
 from jax_dart.data.primitive_shards import iter_vae_batches, load_metadata
 from jax_dart.models.mld_vae import AutoMldVae, vae_reconstruction_kl_loss
+from jax_dart.models.smplx_joints import load_smplx_joints_model, smpl_joint_loss_from_motion
 from jax_dart.models.temporal_smpl_loss import (
     load_motion_normalization,
     temporal_smpl_feature_loss,
@@ -102,6 +103,47 @@ def _make_optimizer(model, learning_rate: float, weight_decay: float):
     )
 
 
+def _uses_smpl_joint_loss(args: argparse.Namespace) -> bool:
+    return bool(args.weight_smpl_joints_rec or args.weight_joints_consistency)
+
+
+def _future_betas_from_batch(
+    batch: Dict[str, np.ndarray],
+    *,
+    history_length: int,
+    future_length: int,
+) -> np.ndarray:
+    if "betas" not in batch:
+        raise KeyError("SMPL joint losses require exported shard betas.")
+    return batch["betas"][:, history_length : history_length + future_length, :].astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _betas_for_step(
+    batch: Dict[str, np.ndarray],
+    *,
+    history_length: int,
+    future_length: int,
+    batch_size: int,
+    require_betas: bool,
+) -> np.ndarray:
+    if require_betas:
+        return _future_betas_from_batch(
+            batch,
+            history_length=history_length,
+            future_length=future_length,
+        )
+    if "betas" in batch:
+        return _future_betas_from_batch(
+            batch,
+            history_length=history_length,
+            future_length=future_length,
+        )
+    return np.zeros((batch_size, future_length, 10), dtype=np.float32)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a tiny JAX/NNX DART VAE train smoke.")
     parser.add_argument("--root", required=True)
@@ -118,6 +160,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-joints-delta", type=float, default=0.0)
     parser.add_argument("--weight-transl-delta", type=float, default=0.0)
     parser.add_argument("--weight-orient-delta", type=float, default=0.0)
+    parser.add_argument("--weight-smpl-joints-rec", type=float, default=0.0)
+    parser.add_argument("--weight-joints-consistency", type=float, default=0.0)
+    parser.add_argument("--smpl-model-dir", default=None)
+    parser.add_argument("--smpl-gender", default="male", choices=["male"])
     parser.add_argument("--h-dim", type=int, default=256)
     parser.add_argument("--ff-size", type=int, default=1024)
     parser.add_argument("--num-layers", type=int, default=7)
@@ -150,17 +196,25 @@ def main() -> None:
     metadata = load_metadata(args.root)
     feature_dim = int(metadata["primitive"]["feature_dim"])
     feature_slices = metadata["primitive"]["feature_slices"]
+    history_length = int(metadata["primitive"]["history_length"])
+    future_length = int(metadata["primitive"]["future_length"])
     norm_mean_np, norm_std_np = load_motion_normalization(args.root)
     norm_mean = jnp.asarray(norm_mean_np, dtype=jnp.float32)
     norm_std = jnp.asarray(norm_std_np, dtype=jnp.float32)
     dtype = _jax_dtype(args.dtype)
+    use_smpl_joint_loss = _uses_smpl_joint_loss(args)
+    if use_smpl_joint_loss and args.smpl_model_dir is None:
+        raise SystemExit("--smpl-model-dir is required when SMPL joint loss weights are nonzero.")
+    smplx_model = None
+    if use_smpl_joint_loss:
+        smplx_model = load_smplx_joints_model(args.smpl_model_dir, gender=args.smpl_gender)
 
     model = _make_model(args, feature_dim)
     _maybe_load_snapshot(model, args)
     optimizer = _make_optimizer(model, args.learning_rate, args.weight_decay)
 
     @nnx.jit
-    def eval_step(model, history, future):
+    def eval_step(model, history, future, betas):
         latent, dist = model.encode(future, history, rng=None)
         future_pred = model.decode(latent, history, nfuture=future.shape[1])
         loss, terms = vae_reconstruction_kl_loss(
@@ -181,6 +235,25 @@ def main() -> None:
             weight_orient_delta=args.weight_orient_delta,
         )
         loss = loss + temporal_loss
+        if use_smpl_joint_loss:
+            smpl_loss, smpl_terms = smpl_joint_loss_from_motion(
+                smplx_model,
+                pred_motion=future_pred,
+                gt_motion=future,
+                betas=betas,
+                feature_slices=feature_slices,
+                norm_mean=norm_mean,
+                norm_std=norm_std,
+                weight_smpl_joints_rec=args.weight_smpl_joints_rec,
+                weight_joints_consistency=args.weight_joints_consistency,
+            )
+            loss = loss + smpl_loss
+        else:
+            smpl_terms = {
+                "smpl_joints_rec": jnp.asarray(0.0, dtype=jnp.float32),
+                "joints_consistency": jnp.asarray(0.0, dtype=jnp.float32),
+                "smpl_joint_loss": jnp.asarray(0.0, dtype=jnp.float32),
+            }
         return (
             loss,
             terms["rec"],
@@ -189,10 +262,13 @@ def main() -> None:
             temporal_terms["transl_delta"],
             temporal_terms["orient_delta"],
             temporal_terms["temporal_smpl"],
+            smpl_terms["smpl_joints_rec"],
+            smpl_terms["joints_consistency"],
+            smpl_terms["smpl_joint_loss"],
         )
 
     @nnx.jit
-    def train_step(model, optimizer, history, future):
+    def train_step(model, optimizer, history, future, betas):
         def loss_fn(model):
             latent, dist = model.encode(future, history, rng=None)
             future_pred = model.decode(latent, history, nfuture=future.shape[1])
@@ -214,6 +290,25 @@ def main() -> None:
                 weight_orient_delta=args.weight_orient_delta,
             )
             loss = loss + temporal_loss
+            if use_smpl_joint_loss:
+                smpl_loss, smpl_terms = smpl_joint_loss_from_motion(
+                    smplx_model,
+                    pred_motion=future_pred,
+                    gt_motion=future,
+                    betas=betas,
+                    feature_slices=feature_slices,
+                    norm_mean=norm_mean,
+                    norm_std=norm_std,
+                    weight_smpl_joints_rec=args.weight_smpl_joints_rec,
+                    weight_joints_consistency=args.weight_joints_consistency,
+                )
+                loss = loss + smpl_loss
+            else:
+                smpl_terms = {
+                    "smpl_joints_rec": jnp.asarray(0.0, dtype=jnp.float32),
+                    "joints_consistency": jnp.asarray(0.0, dtype=jnp.float32),
+                    "smpl_joint_loss": jnp.asarray(0.0, dtype=jnp.float32),
+                }
             return loss, (
                 terms["rec"],
                 terms["kl"],
@@ -221,6 +316,9 @@ def main() -> None:
                 temporal_terms["transl_delta"],
                 temporal_terms["orient_delta"],
                 temporal_terms["temporal_smpl"],
+                smpl_terms["smpl_joints_rec"],
+                smpl_terms["joints_consistency"],
+                smpl_terms["smpl_joint_loss"],
             )
 
         (loss, terms), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
@@ -231,6 +329,16 @@ def main() -> None:
     first_batch = next(batches)
     first_history = jnp.asarray(first_batch["history"], dtype=dtype)
     first_future = jnp.asarray(first_batch["future"], dtype=dtype)
+    first_betas = jnp.asarray(
+        _betas_for_step(
+            first_batch,
+            history_length=history_length,
+            future_length=future_length,
+            batch_size=first_future.shape[0],
+            require_betas=use_smpl_joint_loss,
+        ),
+        dtype=jnp.float32,
+    )
 
     (
         initial_loss,
@@ -240,7 +348,10 @@ def main() -> None:
         initial_transl_delta,
         initial_orient_delta,
         initial_temporal_smpl,
-    ) = eval_step(model, first_history, first_future)
+        initial_smpl_joints_rec,
+        initial_joints_consistency,
+        initial_smpl_joint_loss,
+    ) = eval_step(model, first_history, first_future, first_betas)
     print("backend:", jax.default_backend())
     print("devices:", jax.devices())
     print("metadata_format:", metadata["format"])
@@ -253,6 +364,9 @@ def main() -> None:
     print("initial_transl_delta:", initial_transl_delta)
     print("initial_orient_delta:", initial_orient_delta)
     print("initial_temporal_smpl:", initial_temporal_smpl)
+    print("initial_smpl_joints_rec:", initial_smpl_joints_rec)
+    print("initial_joints_consistency:", initial_joints_consistency)
+    print("initial_smpl_joint_loss:", initial_smpl_joint_loss)
     _assert_finite("initial_loss", initial_loss, args.fail_on_nonfinite)
 
     for step in range(1, args.steps + 1):
@@ -262,19 +376,44 @@ def main() -> None:
             batch = next(batches)
         history = jnp.asarray(batch["history"], dtype=dtype)
         future = jnp.asarray(batch["future"], dtype=dtype)
-        loss, rec, kl, joints_delta, transl_delta, orient_delta, temporal_smpl = train_step(
+        betas = jnp.asarray(
+            _betas_for_step(
+                batch,
+                history_length=history_length,
+                future_length=future_length,
+                batch_size=future.shape[0],
+                require_betas=use_smpl_joint_loss,
+            ),
+            dtype=jnp.float32,
+        )
+        (
+            loss,
+            rec,
+            kl,
+            joints_delta,
+            transl_delta,
+            orient_delta,
+            temporal_smpl,
+            smpl_joints_rec,
+            joints_consistency,
+            smpl_joint_loss,
+        ) = train_step(
             model,
             optimizer,
             history,
             future,
+            betas,
         )
         _assert_finite("loss", loss, args.fail_on_nonfinite)
         if step == 1 or step == args.steps or step % args.log_every == 0:
             print(
                 f"step={step} loss={loss} rec={rec} kl={kl} "
                 f"temporal_smpl={temporal_smpl} "
+                f"smpl_joint_loss={smpl_joint_loss} "
                 f"joints_delta={joints_delta} transl_delta={transl_delta} "
-                f"orient_delta={orient_delta}"
+                f"orient_delta={orient_delta} "
+                f"smpl_joints_rec={smpl_joints_rec} "
+                f"joints_consistency={joints_consistency}"
             )
 
     (
@@ -285,7 +424,10 @@ def main() -> None:
         final_transl_delta,
         final_orient_delta,
         final_temporal_smpl,
-    ) = eval_step(model, first_history, first_future)
+        final_smpl_joints_rec,
+        final_joints_consistency,
+        final_smpl_joint_loss,
+    ) = eval_step(model, first_history, first_future, first_betas)
     _assert_finite("final_loss", final_loss, args.fail_on_nonfinite)
     print("final_loss_on_first_batch:", final_loss)
     print("final_rec_on_first_batch:", final_rec)
@@ -294,6 +436,9 @@ def main() -> None:
     print("final_transl_delta_on_first_batch:", final_transl_delta)
     print("final_orient_delta_on_first_batch:", final_orient_delta)
     print("final_temporal_smpl_on_first_batch:", final_temporal_smpl)
+    print("final_smpl_joints_rec_on_first_batch:", final_smpl_joints_rec)
+    print("final_joints_consistency_on_first_batch:", final_joints_consistency)
+    print("final_smpl_joint_loss_on_first_batch:", final_smpl_joint_loss)
     print("loss_delta_on_first_batch:", final_loss - initial_loss)
     print("optimizer_step:", optimizer.step[...])
 

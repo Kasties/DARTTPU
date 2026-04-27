@@ -159,6 +159,8 @@ def _torch_smplx_joints(
         ext="npz",
         num_pca_comps=12,
     ).to(device).eval()
+    for parameter in body_model.parameters():
+        parameter.requires_grad_(False)
     rot_mats = transforms.rotation_6d_to_matrix(poses_6d.reshape(-1, 22, 6))
     output = body_model(
         return_verts=False,

@@ -22,6 +22,7 @@ ArrayMap = Dict[str, np.ndarray]
 FORWARD_NAMES = ("mu", "logvar", "std", "latent", "future_pred")
 GRAD_NAMES = ("loss", "rec", "kl", "grad_history", "grad_future")
 TEMPORAL_NAMES = ("joints_delta", "transl_delta", "orient_delta", "temporal_smpl")
+SMPL_JOINT_NAMES = ("smpl_joints_rec", "joints_consistency", "smpl_joint_loss")
 
 
 def _parse_latent_dim(value: str) -> Tuple[int, int]:
@@ -266,6 +267,11 @@ def _config_from_args(
         "weight_joints_delta": float(args.weight_joints_delta),
         "weight_transl_delta": float(args.weight_transl_delta),
         "weight_orient_delta": float(args.weight_orient_delta),
+        "include_smpl_joint_loss": bool(args.include_smpl_joint_loss),
+        "weight_smpl_joints_rec": float(args.weight_smpl_joints_rec),
+        "weight_joints_consistency": float(args.weight_joints_consistency),
+        "smpl_model_dir": args.smpl_model_dir,
+        "smpl_gender": args.smpl_gender,
     }
     if metadata is not None:
         config["metadata_format"] = metadata.get("format")
@@ -363,6 +369,39 @@ def _temporal_weights_from_config(config: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
+def _smpl_joint_weights_from_config(config: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "weight_smpl_joints_rec": float(config.get("weight_smpl_joints_rec", 0.0)),
+        "weight_joints_consistency": float(config.get("weight_joints_consistency", 0.0)),
+    }
+
+
+def _future_betas_from_batch(metadata: dict, batch: Dict[str, np.ndarray]) -> np.ndarray:
+    if "betas" not in batch:
+        raise KeyError("SMPL joint losses require exported shard betas.")
+    history_length = int(metadata["primitive"]["history_length"])
+    future_length = int(metadata["primitive"]["future_length"])
+    return batch["betas"][:, history_length : history_length + future_length, :].astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _torch_build_smplx_model(smpl_model_dir: str, device: str, gender: str = "male"):
+    import smplx
+
+    model = smplx.build_layer(
+        smpl_model_dir,
+        model_type="smplx",
+        gender=gender,
+        ext="npz",
+        num_pca_comps=12,
+    ).to(device).eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
 def _torch_temporal_smpl_feature_loss(
     history,
     future_pred,
@@ -439,6 +478,111 @@ def deterministic_torch_temporal_smpl_outputs(
     }
 
 
+def _torch_smpl_joints_from_motion(
+    body_model,
+    motion,
+    betas,
+    *,
+    feature_slices: Dict[str, Any],
+):
+    from pytorch3d import transforms
+
+    features = _torch_slice_motion_features(motion, feature_slices)
+    poses_6d = features["poses_6d"]
+    transl = features["transl"]
+    batch_size, frames = poses_6d.shape[:2]
+    rot_mats = transforms.rotation_6d_to_matrix(poses_6d.reshape(-1, 22, 6))
+    smplxout = body_model(
+        return_verts=False,
+        betas=betas.reshape(-1, 10),
+        global_orient=rot_mats[:, 0],
+        body_pose=rot_mats[:, 1:],
+        transl=transl.reshape(-1, 3),
+    )
+    return smplxout.joints[:, :22, :].reshape(batch_size, frames, 22, 3)
+
+
+def _torch_smpl_joint_loss(
+    future_pred,
+    future,
+    *,
+    betas,
+    body_model,
+    feature_slices: Dict[str, Any],
+    norm_mean_np: np.ndarray,
+    norm_std_np: np.ndarray,
+    weights: Dict[str, float],
+) -> Dict[str, Any]:
+    import torch
+
+    norm_mean = torch.as_tensor(norm_mean_np, device=future_pred.device, dtype=torch.float32)
+    norm_std = torch.as_tensor(norm_std_np, device=future_pred.device, dtype=torch.float32)
+    pred_motion = future_pred.float() * norm_std + norm_mean
+    gt_motion = future.float() * norm_std + norm_mean
+
+    pred_features = _torch_slice_motion_features(pred_motion, feature_slices)
+    pred_feature_joints = pred_features["joints"].reshape(*pred_motion.shape[:-1], 22, 3)
+    pred_smpl_joints = _torch_smpl_joints_from_motion(
+        body_model,
+        pred_motion,
+        betas,
+        feature_slices=feature_slices,
+    )
+    with torch.no_grad():
+        gt_smpl_joints = _torch_smpl_joints_from_motion(
+            body_model,
+            gt_motion,
+            betas,
+            feature_slices=feature_slices,
+        )
+
+    terms = {
+        "smpl_joints_rec": torch.mean(_torch_huber_loss(pred_smpl_joints, gt_smpl_joints)),
+        "joints_consistency": torch.mean(_torch_huber_loss(pred_feature_joints, pred_smpl_joints)),
+    }
+    terms["smpl_joint_loss"] = (
+        weights["weight_smpl_joints_rec"] * terms["smpl_joints_rec"]
+        + weights["weight_joints_consistency"] * terms["joints_consistency"]
+    )
+    return terms
+
+
+def deterministic_torch_smpl_joint_outputs(
+    future_pred_np: np.ndarray,
+    future_np: np.ndarray,
+    betas_np: np.ndarray,
+    device: str,
+    *,
+    smpl_model_dir: str,
+    smpl_gender: str,
+    feature_slices: Dict[str, Any],
+    norm_mean_np: np.ndarray,
+    norm_std_np: np.ndarray,
+    weights: Dict[str, float],
+) -> ArrayMap:
+    import torch
+
+    body_model = _torch_build_smplx_model(smpl_model_dir, device, gender=smpl_gender)
+    future_pred = torch.from_numpy(future_pred_np).to(device=device, dtype=torch.float32)
+    future = torch.from_numpy(future_np).to(device=device, dtype=torch.float32)
+    betas = torch.from_numpy(betas_np).to(device=device, dtype=torch.float32)
+    with torch.no_grad():
+        terms = _torch_smpl_joint_loss(
+            future_pred,
+            future,
+            betas=betas,
+            body_model=body_model,
+            feature_slices=feature_slices,
+            norm_mean_np=norm_mean_np,
+            norm_std_np=norm_std_np,
+            weights=weights,
+        )
+    return {
+        name: _torch_numpy(terms[name]).reshape(())
+        for name in SMPL_JOINT_NAMES
+    }
+
+
 def _torch_deterministic_parts(torch_model, history, future):
     import torch
 
@@ -473,6 +617,10 @@ def deterministic_torch_loss_and_input_grads(
     norm_mean_np: Optional[np.ndarray] = None,
     norm_std_np: Optional[np.ndarray] = None,
     temporal_weights: Optional[Dict[str, float]] = None,
+    betas_np: Optional[np.ndarray] = None,
+    smpl_model_dir: Optional[str] = None,
+    smpl_gender: str = "male",
+    smpl_joint_weights: Optional[Dict[str, float]] = None,
 ) -> ArrayMap:
     import torch
 
@@ -500,6 +648,25 @@ def deterministic_torch_loss_and_input_grads(
             weights=temporal_weights,
         )
         loss = loss + temporal_terms["temporal_smpl"]
+    smpl_terms = {}
+    if smpl_model_dir is not None:
+        if feature_slices is None or norm_mean_np is None or norm_std_np is None:
+            raise ValueError("SMPL joint loss requires feature slices and normalization.")
+        if betas_np is None or smpl_joint_weights is None:
+            raise ValueError("SMPL joint loss requires betas and weights.")
+        body_model = _torch_build_smplx_model(smpl_model_dir, device, gender=smpl_gender)
+        betas = torch.from_numpy(betas_np).to(device=device, dtype=torch.float32)
+        smpl_terms = _torch_smpl_joint_loss(
+            future_pred,
+            future,
+            betas=betas,
+            body_model=body_model,
+            feature_slices=feature_slices,
+            norm_mean_np=norm_mean_np,
+            norm_std_np=norm_std_np,
+            weights=smpl_joint_weights,
+        )
+        loss = loss + smpl_terms["smpl_joint_loss"]
     loss.backward()
 
     outputs = {
@@ -512,6 +679,9 @@ def deterministic_torch_loss_and_input_grads(
     for name in TEMPORAL_NAMES:
         if name in temporal_terms:
             outputs[name] = _torch_numpy(temporal_terms[name]).reshape(())
+    for name in SMPL_JOINT_NAMES:
+        if name in smpl_terms:
+            outputs[name] = _torch_numpy(smpl_terms[name]).reshape(())
     return outputs
 
 
@@ -525,17 +695,22 @@ def deterministic_jax_loss_and_input_grads(
     norm_mean_np: Optional[np.ndarray] = None,
     norm_std_np: Optional[np.ndarray] = None,
     temporal_weights: Optional[Dict[str, float]] = None,
+    betas_np: Optional[np.ndarray] = None,
+    smplx_model=None,
+    smpl_joint_weights: Optional[Dict[str, float]] = None,
 ) -> ArrayMap:
     import jax
     import jax.numpy as jnp
 
     from jax_dart.models.mld_vae import vae_reconstruction_kl_loss
+    from jax_dart.models.smplx_joints import smpl_joint_loss_from_motion
     from jax_dart.models.temporal_smpl_loss import temporal_smpl_feature_loss
 
     history = jnp.asarray(history_np, dtype=jnp.float32)
     future = jnp.asarray(future_np, dtype=jnp.float32)
     norm_mean = None if norm_mean_np is None else jnp.asarray(norm_mean_np, dtype=jnp.float32)
     norm_std = None if norm_std_np is None else jnp.asarray(norm_std_np, dtype=jnp.float32)
+    betas = None if betas_np is None else jnp.asarray(betas_np, dtype=jnp.float32)
 
     def loss_fn(history_value, future_value):
         latent, dist = jax_model.encode(future_value, history_value, rng=None)
@@ -563,6 +738,24 @@ def deterministic_jax_loss_and_input_grads(
             )
             loss = loss + temporal_loss
             aux_terms.update(temporal_terms)
+        if smplx_model is not None:
+            if feature_slices is None or norm_mean is None or norm_std is None:
+                raise ValueError("SMPL joint loss requires feature slices and normalization.")
+            if betas is None or smpl_joint_weights is None:
+                raise ValueError("SMPL joint loss requires betas and weights.")
+            smpl_loss, smpl_terms = smpl_joint_loss_from_motion(
+                smplx_model,
+                pred_motion=future_pred,
+                gt_motion=future_value,
+                betas=betas,
+                feature_slices=feature_slices,
+                norm_mean=norm_mean,
+                norm_std=norm_std,
+                weight_smpl_joints_rec=smpl_joint_weights["weight_smpl_joints_rec"],
+                weight_joints_consistency=smpl_joint_weights["weight_joints_consistency"],
+            )
+            loss = loss + smpl_loss
+            aux_terms.update(smpl_terms)
         return loss, aux_terms
 
     (loss, terms), (grad_history, grad_future) = jax.value_and_grad(
@@ -579,6 +772,9 @@ def deterministic_jax_loss_and_input_grads(
         "grad_future": np.asarray(jax.device_get(grad_future), dtype=np.float32),
     }
     for name in TEMPORAL_NAMES:
+        if name in terms:
+            outputs[name] = np.asarray(jax.device_get(terms[name]), dtype=np.float32).reshape(())
+    for name in SMPL_JOINT_NAMES:
         if name in terms:
             outputs[name] = np.asarray(jax.device_get(terms[name]), dtype=np.float32).reshape(())
     return outputs
@@ -615,6 +811,44 @@ def deterministic_jax_temporal_smpl_outputs(
     return {
         name: np.asarray(jax.device_get(terms[name]), dtype=np.float32).reshape(())
         for name in TEMPORAL_NAMES
+    }
+
+
+def deterministic_jax_smpl_joint_outputs(
+    future_pred_np: np.ndarray,
+    future_np: np.ndarray,
+    betas_np: np.ndarray,
+    *,
+    smplx_model,
+    feature_slices: Dict[str, Any],
+    norm_mean_np: np.ndarray,
+    norm_std_np: np.ndarray,
+    weights: Dict[str, float],
+) -> ArrayMap:
+    import jax
+    import jax.numpy as jnp
+
+    from jax_dart.models.smplx_joints import smpl_joint_loss_from_motion
+
+    future_pred = jnp.asarray(future_pred_np, dtype=jnp.float32)
+    future = jnp.asarray(future_np, dtype=jnp.float32)
+    betas = jnp.asarray(betas_np, dtype=jnp.float32)
+    norm_mean = jnp.asarray(norm_mean_np, dtype=jnp.float32)
+    norm_std = jnp.asarray(norm_std_np, dtype=jnp.float32)
+    _, terms = smpl_joint_loss_from_motion(
+        smplx_model,
+        pred_motion=future_pred,
+        gt_motion=future,
+        betas=betas,
+        feature_slices=feature_slices,
+        norm_mean=norm_mean,
+        norm_std=norm_std,
+        weight_smpl_joints_rec=weights["weight_smpl_joints_rec"],
+        weight_joints_consistency=weights["weight_joints_consistency"],
+    )
+    return {
+        name: np.asarray(jax.device_get(terms[name]), dtype=np.float32).reshape(())
+        for name in SMPL_JOINT_NAMES
     }
 
 
@@ -656,6 +890,7 @@ def _save_snapshot(
     jax_grad_outputs: Optional[ArrayMap] = None,
     norm_mean: Optional[np.ndarray] = None,
     norm_std: Optional[np.ndarray] = None,
+    future_betas: Optional[np.ndarray] = None,
 ) -> None:
     arrays = {
         "config_json": np.array(json.dumps(config, sort_keys=True)),
@@ -679,6 +914,8 @@ def _save_snapshot(
         arrays["norm_mean"] = norm_mean.astype(np.float32, copy=False)
     if norm_std is not None:
         arrays["norm_std"] = norm_std.astype(np.float32, copy=False)
+    if future_betas is not None:
+        arrays["future_betas"] = future_betas.astype(np.float32, copy=False)
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, **arrays)
@@ -717,8 +954,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-joints-delta", type=float, default=0.0)
     parser.add_argument("--weight-transl-delta", type=float, default=0.0)
     parser.add_argument("--weight-orient-delta", type=float, default=0.0)
+    parser.add_argument("--weight-smpl-joints-rec", type=float, default=0.0)
+    parser.add_argument("--weight-joints-consistency", type=float, default=0.0)
+    parser.add_argument("--smpl-model-dir", default=None)
+    parser.add_argument("--smpl-gender", default="male", choices=["male"])
     parser.add_argument("--include-grads", action="store_true")
     parser.add_argument("--include-temporal-smpl-loss", action="store_true")
+    parser.add_argument("--include-smpl-joint-loss", action="store_true")
     parser.add_argument("--fail-on-mismatch", action="store_true")
     parser.add_argument("--out-npz", default=None, help="Optional path for saving snapshot/output arrays.")
     return parser.parse_args()
@@ -730,17 +972,20 @@ def _require(value: Optional[str], message: str) -> str:
     return value
 
 
-def _load_batch_with_metadata(root: str, batch_samples: int) -> Tuple[dict, int, np.ndarray, np.ndarray]:
+def _load_batch_with_metadata(
+    root: str,
+    batch_samples: int,
+) -> Tuple[dict, int, np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     metadata = load_metadata(root)
     feature_dim = int(metadata["primitive"]["feature_dim"])
     batch = next(iter_vae_batches(root, batch_samples=batch_samples))
     history = batch["history"].astype(np.float32, copy=False)
     future = batch["future"].astype(np.float32, copy=False)
-    return metadata, feature_dim, history, future
+    return metadata, feature_dim, history, future, batch
 
 
 def _load_batch(root: str, batch_samples: int) -> Tuple[int, np.ndarray, np.ndarray]:
-    _, feature_dim, history, future = _load_batch_with_metadata(root, batch_samples)
+    _, feature_dim, history, future, _ = _load_batch_with_metadata(root, batch_samples)
     return feature_dim, history, future
 
 
@@ -782,6 +1027,15 @@ def _load_torch_temporal_outputs(snapshot: Dict[str, np.ndarray]) -> Optional[Ar
     }
 
 
+def _load_torch_smpl_joint_outputs(snapshot: Dict[str, np.ndarray]) -> Optional[ArrayMap]:
+    if f"torch_{SMPL_JOINT_NAMES[0]}" not in snapshot:
+        return None
+    return {
+        name: snapshot[f"torch_{name}"].astype(np.float32, copy=False)
+        for name in SMPL_JOINT_NAMES
+    }
+
+
 def _compare_grad_outputs(
     torch_grad_outputs: ArrayMap,
     jax_grad_outputs: ArrayMap,
@@ -818,6 +1072,24 @@ def _compare_temporal_outputs(
     return compared
 
 
+def _compare_smpl_joint_outputs(
+    torch_outputs: ArrayMap,
+    jax_outputs: ArrayMap,
+    atol: float,
+    rtol: float,
+) -> Dict[str, Any]:
+    compared = {}
+    for name in SMPL_JOINT_NAMES:
+        compared[name] = compare_arrays(
+            name,
+            torch_outputs[name],
+            jax_outputs[name],
+            atol=atol,
+            rtol=rtol,
+        )
+    return compared
+
+
 def _maybe_fail(compared: Dict[str, Any]) -> None:
     failed = [name for name, metrics in compared.items() if not metrics["allclose"]]
     if failed:
@@ -832,12 +1104,17 @@ def run_torch_export(args: argparse.Namespace) -> None:
 
     root = _require(args.root, "--root is required for --mode torch-export")
     out_npz = _require(args.out_npz, "--out-npz is required for --mode torch-export")
-    metadata, feature_dim, history, future = _load_batch_with_metadata(root, args.batch_samples)
+    metadata, feature_dim, history, future, batch = _load_batch_with_metadata(root, args.batch_samples)
     config = _config_from_args(args, feature_dim, metadata=metadata)
     norm_mean_np = None
     norm_std_np = None
     temporal_weights = _temporal_weights_from_config(config)
-    if args.include_temporal_smpl_loss:
+    smpl_joint_weights = _smpl_joint_weights_from_config(config)
+    future_betas = None
+    if args.include_smpl_joint_loss:
+        _require(args.smpl_model_dir, "--smpl-model-dir is required for --include-smpl-joint-loss")
+        future_betas = _future_betas_from_batch(metadata, batch)
+    if args.include_temporal_smpl_loss or args.include_smpl_joint_loss:
         norm_mean_np, norm_std_np = _load_motion_normalization_np(root)
 
     torch.manual_seed(args.seed)
@@ -874,6 +1151,21 @@ def run_torch_export(args: argparse.Namespace) -> None:
                 weights=temporal_weights,
             )
         )
+    if args.include_smpl_joint_loss:
+        torch_outputs.update(
+            deterministic_torch_smpl_joint_outputs(
+                torch_outputs["future_pred"],
+                future,
+                future_betas,
+                torch_device,
+                smpl_model_dir=args.smpl_model_dir,
+                smpl_gender=args.smpl_gender,
+                feature_slices=config["feature_slices"],
+                norm_mean_np=norm_mean_np,
+                norm_std_np=norm_std_np,
+                weights=smpl_joint_weights,
+            )
+        )
     torch_grad_outputs = None
     if args.include_grads:
         torch_grad_outputs = deterministic_torch_loss_and_input_grads(
@@ -883,10 +1175,14 @@ def run_torch_export(args: argparse.Namespace) -> None:
             torch_device,
             weight_rec=args.weight_rec,
             weight_kl=args.weight_kl,
-            feature_slices=config["feature_slices"] if args.include_temporal_smpl_loss else None,
+            feature_slices=config["feature_slices"] if (args.include_temporal_smpl_loss or args.include_smpl_joint_loss) else None,
             norm_mean_np=norm_mean_np,
             norm_std_np=norm_std_np,
             temporal_weights=temporal_weights if args.include_temporal_smpl_loss else None,
+            betas_np=future_betas,
+            smpl_model_dir=args.smpl_model_dir if args.include_smpl_joint_loss else None,
+            smpl_gender=args.smpl_gender,
+            smpl_joint_weights=smpl_joint_weights if args.include_smpl_joint_loss else None,
         )
     _save_snapshot(
         out_npz,
@@ -899,6 +1195,7 @@ def run_torch_export(args: argparse.Namespace) -> None:
         torch_grad_outputs=torch_grad_outputs,
         norm_mean=norm_mean_np,
         norm_std=norm_std_np,
+        future_betas=future_betas,
     )
 
     print("torch_device:", torch_device)
@@ -926,19 +1223,32 @@ def run_jax_compare(args: argparse.Namespace) -> None:
     torch_outputs = _load_torch_forward_outputs(snapshot)
     torch_grad_outputs = _load_torch_grad_outputs(snapshot)
     include_temporal = bool(args.include_temporal_smpl_loss or config.get("include_temporal_smpl_loss", False))
+    include_smpl_joint = bool(args.include_smpl_joint_loss or config.get("include_smpl_joint_loss", False))
     torch_temporal_outputs = _load_torch_temporal_outputs(snapshot)
+    torch_smpl_joint_outputs = _load_torch_smpl_joint_outputs(snapshot)
     norm_mean_np = None
     norm_std_np = None
     temporal_weights = _temporal_weights_from_config(config)
-    if include_temporal:
+    smpl_joint_weights = _smpl_joint_weights_from_config(config)
+    future_betas = None
+    smpl_model_dir = args.smpl_model_dir or config.get("smpl_model_dir")
+    if include_temporal or include_smpl_joint:
         if "feature_slices" not in config:
-            raise SystemExit(f"{snapshot_path} does not contain temporal feature slices.")
-        if torch_temporal_outputs is None:
-            raise SystemExit(f"{snapshot_path} does not contain Torch temporal SMPL outputs.")
+            raise SystemExit(f"{snapshot_path} does not contain feature slices.")
         if "norm_mean" not in snapshot or "norm_std" not in snapshot:
             raise SystemExit(f"{snapshot_path} does not contain normalization arrays.")
         norm_mean_np = snapshot["norm_mean"].astype(np.float32, copy=False)
         norm_std_np = snapshot["norm_std"].astype(np.float32, copy=False)
+    if include_temporal:
+        if torch_temporal_outputs is None:
+            raise SystemExit(f"{snapshot_path} does not contain Torch temporal SMPL outputs.")
+    if include_smpl_joint:
+        if torch_smpl_joint_outputs is None:
+            raise SystemExit(f"{snapshot_path} does not contain Torch SMPL joint loss outputs.")
+        if "future_betas" not in snapshot:
+            raise SystemExit(f"{snapshot_path} does not contain future betas.")
+        future_betas = snapshot["future_betas"].astype(np.float32, copy=False)
+        smpl_model_dir = _require(smpl_model_dir, "--smpl-model-dir is required unless the snapshot stores it.")
     if args.include_grads and torch_grad_outputs is None:
         raise SystemExit(f"{snapshot_path} does not contain Torch gradient outputs.")
     torch_state = _load_torch_state_np(snapshot)
@@ -965,6 +1275,14 @@ def run_jax_compare(args: argparse.Namespace) -> None:
         num_layers=int(config["num_layers"]),
         arch=config["arch"],
     )
+    smplx_model = None
+    if include_smpl_joint:
+        from jax_dart.models.smplx_joints import load_smplx_joints_model
+
+        smplx_model = load_smplx_joints_model(
+            smpl_model_dir,
+            gender=config.get("smpl_gender", args.smpl_gender),
+        )
 
     jax_outputs = deterministic_jax_forward(jax_model, history, future)
     jax_temporal_outputs = None
@@ -976,6 +1294,18 @@ def run_jax_compare(args: argparse.Namespace) -> None:
             norm_mean_np=norm_mean_np,
             norm_std_np=norm_std_np,
             weights=temporal_weights,
+        )
+    jax_smpl_joint_outputs = None
+    if include_smpl_joint:
+        jax_smpl_joint_outputs = deterministic_jax_smpl_joint_outputs(
+            jax_outputs["future_pred"],
+            future,
+            future_betas,
+            smplx_model=smplx_model,
+            feature_slices=config["feature_slices"],
+            norm_mean_np=norm_mean_np,
+            norm_std_np=norm_std_np,
+            weights=smpl_joint_weights,
         )
 
     print("jax_backend:", jax.default_backend())
@@ -991,6 +1321,14 @@ def run_jax_compare(args: argparse.Namespace) -> None:
             atol=args.grad_atol,
             rtol=args.grad_rtol,
         )
+    compared_smpl = {}
+    if include_smpl_joint:
+        compared_smpl = _compare_smpl_joint_outputs(
+            torch_smpl_joint_outputs,
+            jax_smpl_joint_outputs,
+            atol=args.grad_atol,
+            rtol=args.grad_rtol,
+        )
     compared_grads = {}
     jax_grad_outputs = None
     if args.include_grads or torch_grad_outputs is not None:
@@ -1000,10 +1338,13 @@ def run_jax_compare(args: argparse.Namespace) -> None:
             future,
             weight_rec=float(config.get("weight_rec", args.weight_rec)),
             weight_kl=float(config.get("weight_kl", args.weight_kl)),
-            feature_slices=config["feature_slices"] if include_temporal else None,
+            feature_slices=config["feature_slices"] if (include_temporal or include_smpl_joint) else None,
             norm_mean_np=norm_mean_np,
             norm_std_np=norm_std_np,
             temporal_weights=temporal_weights if include_temporal else None,
+            betas_np=future_betas,
+            smplx_model=smplx_model,
+            smpl_joint_weights=smpl_joint_weights if include_smpl_joint else None,
         )
         compared_grads = _compare_grad_outputs(
             torch_grad_outputs,
@@ -1018,6 +1359,9 @@ def run_jax_compare(args: argparse.Namespace) -> None:
         if include_temporal:
             torch_save_outputs.update(torch_temporal_outputs)
             jax_save_outputs.update(jax_temporal_outputs)
+        if include_smpl_joint:
+            torch_save_outputs.update(torch_smpl_joint_outputs)
+            jax_save_outputs.update(jax_smpl_joint_outputs)
         _save_snapshot(
             args.out_npz,
             history,
@@ -1030,12 +1374,14 @@ def run_jax_compare(args: argparse.Namespace) -> None:
             jax_grad_outputs=jax_grad_outputs,
             norm_mean=norm_mean_np,
             norm_std=norm_std_np,
+            future_betas=future_betas,
         )
         print("wrote:", args.out_npz)
 
     if args.fail_on_mismatch:
         _maybe_fail(compared)
         _maybe_fail(compared_temporal)
+        _maybe_fail(compared_smpl)
         _maybe_fail(compared_grads)
 
 
@@ -1048,12 +1394,17 @@ def run_both(args: argparse.Namespace) -> None:
     from model.mld_vae import AutoMldVae as TorchAutoMldVae
 
     root = _require(args.root, "--root is required for --mode both")
-    metadata, feature_dim, history, future = _load_batch_with_metadata(root, args.batch_samples)
+    metadata, feature_dim, history, future, batch = _load_batch_with_metadata(root, args.batch_samples)
     config = _config_from_args(args, feature_dim, metadata=metadata)
     norm_mean_np = None
     norm_std_np = None
     temporal_weights = _temporal_weights_from_config(config)
-    if args.include_temporal_smpl_loss:
+    smpl_joint_weights = _smpl_joint_weights_from_config(config)
+    future_betas = None
+    if args.include_smpl_joint_loss:
+        _require(args.smpl_model_dir, "--smpl-model-dir is required for --include-smpl-joint-loss")
+        future_betas = _future_betas_from_batch(metadata, batch)
+    if args.include_temporal_smpl_loss or args.include_smpl_joint_loss:
         norm_mean_np, norm_std_np = _load_motion_normalization_np(root)
 
     torch.manual_seed(args.seed)
@@ -1092,6 +1443,11 @@ def run_both(args: argparse.Namespace) -> None:
         rngs=nnx.Rngs(args.seed),
     )
     copy_torch_vae_to_jax(torch_model, jax_model, num_layers=args.num_layers, arch=args.arch)
+    smplx_model = None
+    if args.include_smpl_joint_loss:
+        from jax_dart.models.smplx_joints import load_smplx_joints_model
+
+        smplx_model = load_smplx_joints_model(args.smpl_model_dir, gender=args.smpl_gender)
 
     torch_outputs = deterministic_torch_forward(torch_model, history, future, torch_device)
     jax_outputs = deterministic_jax_forward(jax_model, history, future)
@@ -1115,6 +1471,31 @@ def run_both(args: argparse.Namespace) -> None:
             norm_std_np=norm_std_np,
             weights=temporal_weights,
         )
+    torch_smpl_joint_outputs = None
+    jax_smpl_joint_outputs = None
+    if args.include_smpl_joint_loss:
+        torch_smpl_joint_outputs = deterministic_torch_smpl_joint_outputs(
+            torch_outputs["future_pred"],
+            future,
+            future_betas,
+            torch_device,
+            smpl_model_dir=args.smpl_model_dir,
+            smpl_gender=args.smpl_gender,
+            feature_slices=config["feature_slices"],
+            norm_mean_np=norm_mean_np,
+            norm_std_np=norm_std_np,
+            weights=smpl_joint_weights,
+        )
+        jax_smpl_joint_outputs = deterministic_jax_smpl_joint_outputs(
+            jax_outputs["future_pred"],
+            future,
+            future_betas,
+            smplx_model=smplx_model,
+            feature_slices=config["feature_slices"],
+            norm_mean_np=norm_mean_np,
+            norm_std_np=norm_std_np,
+            weights=smpl_joint_weights,
+        )
     torch_grad_outputs = None
     jax_grad_outputs = None
     if args.include_grads:
@@ -1125,10 +1506,14 @@ def run_both(args: argparse.Namespace) -> None:
             torch_device,
             weight_rec=args.weight_rec,
             weight_kl=args.weight_kl,
-            feature_slices=config["feature_slices"] if args.include_temporal_smpl_loss else None,
+            feature_slices=config["feature_slices"] if (args.include_temporal_smpl_loss or args.include_smpl_joint_loss) else None,
             norm_mean_np=norm_mean_np,
             norm_std_np=norm_std_np,
             temporal_weights=temporal_weights if args.include_temporal_smpl_loss else None,
+            betas_np=future_betas,
+            smpl_model_dir=args.smpl_model_dir if args.include_smpl_joint_loss else None,
+            smpl_gender=args.smpl_gender,
+            smpl_joint_weights=smpl_joint_weights if args.include_smpl_joint_loss else None,
         )
         jax_grad_outputs = deterministic_jax_loss_and_input_grads(
             jax_model,
@@ -1136,10 +1521,13 @@ def run_both(args: argparse.Namespace) -> None:
             future,
             weight_rec=args.weight_rec,
             weight_kl=args.weight_kl,
-            feature_slices=config["feature_slices"] if args.include_temporal_smpl_loss else None,
+            feature_slices=config["feature_slices"] if (args.include_temporal_smpl_loss or args.include_smpl_joint_loss) else None,
             norm_mean_np=norm_mean_np,
             norm_std_np=norm_std_np,
             temporal_weights=temporal_weights if args.include_temporal_smpl_loss else None,
+            betas_np=future_betas,
+            smplx_model=smplx_model,
+            smpl_joint_weights=smpl_joint_weights if args.include_smpl_joint_loss else None,
         )
 
     print("torch_device:", torch_device)
@@ -1153,6 +1541,14 @@ def run_both(args: argparse.Namespace) -> None:
         compared_temporal = _compare_temporal_outputs(
             torch_temporal_outputs,
             jax_temporal_outputs,
+            atol=args.grad_atol,
+            rtol=args.grad_rtol,
+        )
+    compared_smpl = {}
+    if args.include_smpl_joint_loss:
+        compared_smpl = _compare_smpl_joint_outputs(
+            torch_smpl_joint_outputs,
+            jax_smpl_joint_outputs,
             atol=args.grad_atol,
             rtol=args.grad_rtol,
         )
@@ -1171,6 +1567,9 @@ def run_both(args: argparse.Namespace) -> None:
         if args.include_temporal_smpl_loss:
             torch_save_outputs.update(torch_temporal_outputs)
             jax_save_outputs.update(jax_temporal_outputs)
+        if args.include_smpl_joint_loss:
+            torch_save_outputs.update(torch_smpl_joint_outputs)
+            jax_save_outputs.update(jax_smpl_joint_outputs)
         _save_snapshot(
             args.out_npz,
             history,
@@ -1183,12 +1582,14 @@ def run_both(args: argparse.Namespace) -> None:
             jax_grad_outputs=jax_grad_outputs,
             norm_mean=norm_mean_np,
             norm_std=norm_std_np,
+            future_betas=future_betas,
         )
         print("wrote:", args.out_npz)
 
     if args.fail_on_mismatch:
         _maybe_fail(compared)
         _maybe_fail(compared_temporal)
+        _maybe_fail(compared_smpl)
         _maybe_fail(compared_grads)
 
 

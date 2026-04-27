@@ -11,11 +11,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple, Tuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
 from .rotation_conversions import rotation_6d_to_matrix
-from .temporal_smpl_loss import huber_loss, slice_motion_features
+from .temporal_smpl_loss import denormalize_motion, huber_loss, slice_motion_features
 
 
 class SmplxJointsModel(NamedTuple):
@@ -23,7 +24,6 @@ class SmplxJointsModel(NamedTuple):
     shapedirs: Any
     j_regressor: Any
     parents: Tuple[int, ...]
-    gender: str
     num_betas: int
 
 
@@ -89,7 +89,6 @@ def load_smplx_joints_model(
         shapedirs=jnp.asarray(shapedirs),
         j_regressor=jnp.asarray(j_regressor),
         parents=parents,
-        gender=gender,
         num_betas=int(num_betas),
     )
 
@@ -208,3 +207,53 @@ def smpl_joint_loss_terms(
         "smpl_joints_rec": jnp.mean(huber_loss(pred_smpl_joints, gt_smpl_joints)),
         "joints_consistency": jnp.mean(huber_loss(pred_feature_joints, pred_smpl_joints)),
     }
+
+
+def smpl_joint_loss_from_motion(
+    model: SmplxJointsModel,
+    *,
+    pred_motion,
+    gt_motion,
+    betas,
+    feature_slices: Mapping[str, Tuple[int, int]],
+    norm_mean,
+    norm_std,
+    weight_smpl_joints_rec: float = 0.0,
+    weight_joints_consistency: float = 0.0,
+):
+    """Compute DART's differentiable SMPL-X joint loss terms.
+
+    ``pred_motion`` and ``gt_motion`` are normalized future-motion tensors. The
+    GT SMPL joints are explicitly stop-gradient, matching DART's
+    ``torch.no_grad()`` target path.
+    """
+    pred_motion = denormalize_motion(pred_motion, norm_mean, norm_std)
+    gt_motion = denormalize_motion(gt_motion, norm_mean, norm_std)
+
+    pred_features = slice_motion_features(pred_motion, feature_slices)
+    pred_feature_joints = pred_features["joints"].reshape((*pred_motion.shape[:-1], 22, 3))
+    pred_smpl_joints = smplx_joints_from_motion(
+        model,
+        pred_motion,
+        betas,
+        feature_slices=feature_slices,
+    )
+    gt_smpl_joints = smplx_joints_from_motion(
+        model,
+        gt_motion,
+        betas,
+        feature_slices=feature_slices,
+    )
+    gt_smpl_joints = jax.lax.stop_gradient(gt_smpl_joints)
+
+    terms = smpl_joint_loss_terms(
+        pred_smpl_joints=pred_smpl_joints,
+        gt_smpl_joints=gt_smpl_joints,
+        pred_feature_joints=pred_feature_joints,
+    )
+    loss = (
+        weight_smpl_joints_rec * terms["smpl_joints_rec"]
+        + weight_joints_consistency * terms["joints_consistency"]
+    )
+    terms["smpl_joint_loss"] = loss
+    return loss, terms
