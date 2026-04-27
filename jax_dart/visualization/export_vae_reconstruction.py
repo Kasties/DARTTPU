@@ -16,7 +16,13 @@ from typing import Any, Dict, Mapping, Tuple
 
 import numpy as np
 
-from jax_dart.data.primitive_shards import iter_vae_batches, load_metadata
+from jax_dart.data.primitive_shards import (
+    iter_vae_batches,
+    list_shards,
+    load_metadata,
+    load_shard,
+    split_motion_to_vae,
+)
 from jax_dart.models.mld_vae import AutoMldVae
 from jax_dart.models.mld_vae_state import (
     load_torch_style_vae_state,
@@ -153,6 +159,60 @@ def _pickle_safe(value):
     return value
 
 
+def _predict_future_np(model, history_np: np.ndarray, future_np: np.ndarray, dtype_name: str) -> np.ndarray:
+    import jax
+    import jax.numpy as jnp
+
+    dtype = _jax_dtype(dtype_name)
+    history = jnp.asarray(history_np, dtype=dtype)
+    future = jnp.asarray(future_np, dtype=dtype)
+    latent, _ = model.encode(future, history, rng=None)
+    future_pred = model.decode(latent, history, nfuture=future.shape[1])
+    return np.asarray(jax.device_get(future_pred), dtype=np.float32)
+
+
+def _future_rec_per_item(future_pred_np: np.ndarray, future_np: np.ndarray, axes) -> np.ndarray:
+    future_error = future_pred_np - future_np
+    rec = 0.5 * np.minimum(np.abs(future_error), 1.0) ** 2
+    rec += np.maximum(np.abs(future_error) - 1.0, 0.0)
+    return rec.mean(axis=axes)
+
+
+def _stitch_primitives(array: np.ndarray, history_length: int) -> np.ndarray:
+    pieces = [array[0]]
+    for primitive_index in range(1, array.shape[0]):
+        pieces.append(array[primitive_index, history_length:])
+    return np.concatenate(pieces, axis=0)
+
+
+def _select_shard_samples(
+    shard: Dict[str, np.ndarray],
+    *,
+    metadata: Mapping[str, Any],
+    norm_mean: np.ndarray,
+    norm_std: np.ndarray,
+    start_index: int,
+    num_seqs: int,
+    selection: str,
+) -> np.ndarray:
+    sample_count = shard["motion"].shape[0]
+    if selection == "first":
+        return np.arange(start_index, min(start_index + num_seqs, sample_count), dtype=np.int64)
+    if selection != "motion":
+        raise ValueError(f"Unsupported selection {selection}.")
+
+    feature_slices = metadata["primitive"]["feature_slices"]
+    motion = shard["motion"].astype(np.float32, copy=False) * norm_std + norm_mean
+    if "transl_delta" in feature_slices:
+        start, end = feature_slices["transl_delta"]
+    else:
+        start, end = feature_slices["joints_delta"]
+    deltas = motion[..., int(start) : int(end)]
+    scores = np.linalg.norm(deltas, axis=-1).mean(axis=(1, 2))
+    order = np.argsort(-scores)
+    return order[start_index : start_index + num_seqs].astype(np.int64)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export JAX VAE reconstructions for DART visualization.")
     parser.add_argument("--root", required=True, help="Exported TPU primitive dataset root.")
@@ -161,6 +221,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-samples", type=int, default=64)
     parser.add_argument("--num-seqs", type=int, default=4)
     parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument(
+        "--stitch-primitives",
+        action="store_true",
+        help="Export each raw shard sample as one longer clip by stitching its primitives.",
+    )
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument(
+        "--selection",
+        default="first",
+        choices=["first", "motion"],
+        help="For stitched exports, choose first samples or highest-motion samples.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--h-dim", type=int, default=None)
@@ -177,9 +249,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    import jax
-    import jax.numpy as jnp
-
     args = parse_args()
     metadata = load_metadata(args.root)
     primitive = metadata["primitive"]
@@ -194,6 +263,112 @@ def main() -> None:
     model = _make_model(args, checkpoint_config, feature_dim)
     _load_state(model, args.checkpoint, args, checkpoint_config)
 
+    if args.stitch_primitives:
+        shards = list_shards(args.root)
+        if args.shard_index >= len(shards):
+            raise SystemExit(f"--shard-index {args.shard_index} out of range; found {len(shards)} shards.")
+        shard_path = shards[args.shard_index]
+        shard = load_shard(str(shard_path))
+        sample_indices = _select_shard_samples(
+            shard,
+            metadata=metadata,
+            norm_mean=norm_mean,
+            norm_std=norm_std,
+            start_index=args.start_index,
+            num_seqs=args.num_seqs,
+            selection=args.selection,
+        )
+        if sample_indices.shape[0] == 0:
+            raise SystemExit(f"No samples selected from shard {shard_path}.")
+
+        selected_motion = shard["motion"][sample_indices].astype(np.float32, copy=False)
+        sample_count, primitive_count = selected_motion.shape[:2]
+        history_np, future_np = split_motion_to_vae(
+            selected_motion,
+            history_length=history_length,
+            future_length=future_length,
+        )
+        future_pred_np = _predict_future_np(model, history_np, future_np, args.dtype)
+        gt_motion_norm = np.concatenate(
+            [
+                history_np.reshape(sample_count, primitive_count, history_length, feature_dim),
+                future_np.reshape(sample_count, primitive_count, future_length, feature_dim),
+            ],
+            axis=2,
+        )
+        pred_motion_norm = np.concatenate(
+            [
+                history_np.reshape(sample_count, primitive_count, history_length, feature_dim),
+                future_pred_np.reshape(sample_count, primitive_count, future_length, feature_dim),
+            ],
+            axis=2,
+        )
+        gt_motion = gt_motion_norm * norm_std + norm_mean
+        pred_motion = pred_motion_norm * norm_std + norm_mean
+        rec_per_seq = _future_rec_per_item(
+            future_pred_np.reshape(sample_count, primitive_count, future_length, feature_dim),
+            future_np.reshape(sample_count, primitive_count, future_length, feature_dim),
+            axes=(1, 2, 3),
+        )
+
+        out_dir = Path(args.out_dir)
+        summary = []
+        for local_index, raw_sample_index in enumerate(sample_indices):
+            gender = _gender_name(metadata, int(shard["gender"][raw_sample_index]))
+            betas = shard["betas"][raw_sample_index].astype(np.float32, copy=False)
+            stitched_pred = _stitch_primitives(pred_motion[local_index], history_length)
+            stitched_gt = _stitch_primitives(gt_motion[local_index], history_length)
+            stitched_betas = _stitch_primitives(betas, history_length)
+            common = {
+                "batch_index": int(raw_sample_index),
+                "rec": float(rec_per_seq[local_index]),
+                "checkpoint": args.checkpoint,
+                "root": args.root,
+                "shard": str(shard_path),
+                "primitive_count": int(primitive_count),
+                "stitched": True,
+            }
+            pred_record = _primitive_record(
+                motion=stitched_pred,
+                betas=stitched_betas,
+                gender=gender,
+                fps=fps,
+                history_length=history_length,
+                future_length=future_length,
+                feature_slices=feature_slices,
+                text=f"jax vae stitched pred {raw_sample_index} rec={rec_per_seq[local_index]:.6f}",
+                metadata={**common, "kind": "pred"},
+            )
+            gt_record = _primitive_record(
+                motion=stitched_gt,
+                betas=stitched_betas,
+                gender=gender,
+                fps=fps,
+                history_length=history_length,
+                future_length=future_length,
+                feature_slices=feature_slices,
+                text=f"stitched ground truth {raw_sample_index}",
+                metadata={**common, "kind": "gt"},
+            )
+            pred_path = out_dir / f"sample_{raw_sample_index:04d}_stitched_pred.pkl"
+            gt_path = out_dir / f"sample_{raw_sample_index:04d}_stitched_gt.pkl"
+            _write_pkl(pred_path, pred_record)
+            _write_pkl(gt_path, gt_record)
+            summary.append(
+                {
+                    "sample_index": int(raw_sample_index),
+                    "rec": float(rec_per_seq[local_index]),
+                    "pred": str(pred_path),
+                    "gt": str(gt_path),
+                }
+            )
+            print(f"wrote pred={pred_path} gt={gt_path} rec={rec_per_seq[local_index]:.6f}")
+
+        summary_path = out_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        print("summary:", summary_path)
+        return
+
     batch = next(iter_vae_batches(args.root, batch_samples=args.batch_samples))
     end_index = args.start_index + args.num_seqs
     history_np = batch["history"][args.start_index:end_index].astype(np.float32, copy=False)
@@ -203,21 +378,13 @@ def main() -> None:
     if "betas" not in batch:
         raise SystemExit("Exported visualization requires shard betas.")
 
-    dtype = _jax_dtype(args.dtype)
-    history = jnp.asarray(history_np, dtype=dtype)
-    future = jnp.asarray(future_np, dtype=dtype)
-    latent, dist = model.encode(future, history, rng=None)
-    future_pred = model.decode(latent, history, nfuture=future.shape[1])
-    future_pred_np = np.asarray(jax.device_get(future_pred), dtype=np.float32)
+    future_pred_np = _predict_future_np(model, history_np, future_np, args.dtype)
 
     gt_motion_norm = np.concatenate([history_np, future_np], axis=1)
     pred_motion_norm = np.concatenate([history_np, future_pred_np], axis=1)
     gt_motion = gt_motion_norm * norm_std + norm_mean
     pred_motion = pred_motion_norm * norm_std + norm_mean
-    future_error = future_pred_np - future_np
-    rec_per_seq = 0.5 * np.minimum(np.abs(future_error), 1.0) ** 2
-    rec_per_seq += np.maximum(np.abs(future_error) - 1.0, 0.0)
-    rec_per_seq = rec_per_seq.mean(axis=(1, 2))
+    rec_per_seq = _future_rec_per_item(future_pred_np, future_np, axes=(1, 2))
 
     out_dir = Path(args.out_dir)
     summary = []
