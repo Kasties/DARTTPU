@@ -103,6 +103,26 @@ def _global_batch_from_batch_samples(metadata: dict, batch_samples: int) -> int:
     return int(batch_samples) * int(metadata["primitive"]["num_primitive"])
 
 
+def _throughput_row(
+    *,
+    step_delta: int,
+    elapsed_delta: float,
+    batch_samples: int,
+    global_batch: int,
+) -> Dict[str, float]:
+    if elapsed_delta <= 0.0 or step_delta <= 0:
+        return {
+            "steps_per_sec": 0.0,
+            "samples_per_sec": 0.0,
+            "examples_per_sec": 0.0,
+        }
+    return {
+        "steps_per_sec": float(step_delta / elapsed_delta),
+        "samples_per_sec": float((step_delta * batch_samples) / elapsed_delta),
+        "examples_per_sec": float((step_delta * global_batch) / elapsed_delta),
+    }
+
+
 def _check_global_batch(metadata: dict, batch_samples: int, device_count: int) -> None:
     global_batch = _global_batch_from_batch_samples(metadata, batch_samples)
     if global_batch % device_count != 0:
@@ -136,7 +156,8 @@ def main() -> None:
     mesh = _make_data_mesh(jax, args.data_parallel_devices)
     device_count = int(np.asarray(mesh.devices).size)
     _check_global_batch(metadata, args.batch_samples, device_count)
-    per_device_batch = _global_batch_from_batch_samples(metadata, args.batch_samples) // device_count
+    global_batch = _global_batch_from_batch_samples(metadata, args.batch_samples)
+    per_device_batch = global_batch // device_count
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None, None))
     vector_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None))
     norm_mean = jax.device_put(jnp.asarray(norm_mean_np, dtype=jnp.float32), vector_sharding)
@@ -350,6 +371,8 @@ def main() -> None:
         print("trainer: spmd")
         print("mesh:", mesh)
         print("data_parallel_devices:", device_count)
+        print("batch_samples:", args.batch_samples)
+        print("global_batch:", global_batch)
         print("per_device_batch:", per_device_batch)
         print("metadata_format:", metadata["format"])
         print("feature_dim:", feature_dim)
@@ -358,6 +381,8 @@ def main() -> None:
         batches = _cycle_vae_batches(args.root, args.batch_samples)
         run_eval(0)
         start_time = time.time()
+        last_log_step = 0
+        last_log_time = start_time
         last_metrics: Dict[str, object] = {}
         for step in range(1, args.steps + 1):
             batch = next(batches)
@@ -377,7 +402,16 @@ def main() -> None:
             _assert_finite("loss", loss, args.fail_on_nonfinite)
 
             if step == 1 or step == args.steps or step % args.log_every == 0:
-                elapsed = time.time() - start_time
+                now = time.time()
+                elapsed = now - start_time
+                interval = now - last_log_time
+                step_delta = step - last_log_step
+                throughput = _throughput_row(
+                    step_delta=step_delta,
+                    elapsed_delta=interval,
+                    batch_samples=args.batch_samples,
+                    global_batch=global_batch,
+                )
                 row = {
                     "step": int(step),
                     "split": "train",
@@ -394,7 +428,10 @@ def main() -> None:
                     "data_parallel_devices": int(device_count),
                     "per_device_batch": int(per_device_batch),
                     "elapsed_sec": float(elapsed),
-                    "time": time.time(),
+                    "steps_per_sec": throughput["steps_per_sec"],
+                    "samples_per_sec": throughput["samples_per_sec"],
+                    "examples_per_sec": throughput["examples_per_sec"],
+                    "time": now,
                 }
                 _write_metrics(metrics_path, row)
                 last_metrics = row
@@ -403,8 +440,13 @@ def main() -> None:
                     f"rec={row['rec']:.6f} kl={row['kl']:.6f} "
                     f"temporal_smpl={row['temporal_smpl']:.6f} "
                     f"smpl_joint_loss={row['smpl_joint_loss']:.6f} "
+                    f"steps/s={row['steps_per_sec']:.3f} "
+                    f"samples/s={row['samples_per_sec']:.1f} "
+                    f"examples/s={row['examples_per_sec']:.1f} "
                     f"elapsed={elapsed:.1f}s"
                 )
+                last_log_step = step
+                last_log_time = now
 
             if args.eval_every > 0 and step % args.eval_every == 0:
                 last_metrics = run_eval(step)
