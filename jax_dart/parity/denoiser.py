@@ -430,6 +430,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--uncond", action="store_true")
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-4)
+    parser.add_argument(
+        "--allow-tf32",
+        action="store_true",
+        help="Allow Torch TF32 matmuls. Disabled by default for tighter parity.",
+    )
+    parser.add_argument(
+        "--jax-matmul-precision",
+        default="highest",
+        choices=["default", "high", "highest"],
+        help="JAX matmul precision for compare modes.",
+    )
     parser.add_argument("--fail-on-mismatch", action="store_true")
     parser.add_argument("--out-npz", default=None, help="Optional path for saving snapshot/output arrays.")
     return parser.parse_args()
@@ -459,6 +470,23 @@ def _make_torch_model(config: Dict[str, Any], device: str, checkpoint: Optional[
     return torch_model
 
 
+def _configure_torch_precision(torch, *, allow_tf32: bool) -> None:
+    if hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+
+
+def _configure_jax_precision(precision: str) -> None:
+    if precision == "default":
+        return
+    import jax
+
+    jax.config.update("jax_default_matmul_precision", precision)
+
+
 def _make_jax_model(config: Dict[str, Any]):
     from flax import nnx
 
@@ -480,6 +508,7 @@ def _make_jax_model(config: Dict[str, Any]):
 def run_torch_export(args: argparse.Namespace) -> None:
     import torch
 
+    _configure_torch_precision(torch, allow_tf32=args.allow_tf32)
     out_npz = _require(args.out_npz, "--out-npz is required for --mode torch-export")
     history, text, metadata = _load_batch(args)
     config = _config_from_args(args, history, text, metadata=metadata)
@@ -521,6 +550,7 @@ def run_torch_export(args: argparse.Namespace) -> None:
 
 
 def run_jax_compare(args: argparse.Namespace) -> None:
+    _configure_jax_precision(args.jax_matmul_precision)
     import jax
 
     snapshot_path = _require(args.snapshot, "--snapshot is required for --mode jax-compare")
@@ -570,8 +600,11 @@ def run_jax_compare(args: argparse.Namespace) -> None:
 
 
 def run_both(args: argparse.Namespace) -> None:
-    import jax
     import torch
+
+    _configure_torch_precision(torch, allow_tf32=args.allow_tf32)
+    _configure_jax_precision(args.jax_matmul_precision)
+    import jax
 
     history, text, metadata = _load_batch(args)
     config = _config_from_args(args, history, text, metadata=metadata)
