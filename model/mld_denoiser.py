@@ -2,8 +2,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import clip
-import loralib as lora
+try:
+    import clip
+except ImportError:
+    clip = None
+try:
+    import loralib as lora
+except ImportError:
+    class _MissingLora:
+        def Linear(self, *args, **kwargs):
+            raise ImportError("loralib is required when use_lora=True")
+
+    lora = _MissingLora()
 
 
 class DenoiserMLP(nn.Module):
