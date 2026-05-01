@@ -1,4 +1,4 @@
-"""Flax NNX port of DART's MLP denoiser."""
+"""Flax NNX ports of DART's MLD denoisers."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from .torch_compatible import TorchLinear
+from .torch_compatible import TorchLayerNorm, TorchLinear, TorchMultiheadAttention
 
 
 def _gelu_exact(x):
@@ -128,7 +128,104 @@ class MLPBlock(nnx.Module):
         return self.out_fc(h)
 
 
-class DenoiserMLP(nnx.Module):
+class TransformerEncoderLayer(nnx.Module):
+    """PyTorch ``nn.TransformerEncoderLayer`` parity subset.
+
+    DART uses the default PyTorch settings: sequence-first tensors,
+    ``norm_first=False``, no masks, and dropout disabled during parity eval.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        activation: str,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.self_attn = TorchMultiheadAttention(d_model, nhead, rngs=rngs)
+        self.linear1 = TorchLinear(d_model, dim_feedforward, rngs=rngs)
+        self.linear2 = TorchLinear(dim_feedforward, d_model, rngs=rngs)
+        self.norm1 = TorchLayerNorm(d_model, rngs=rngs)
+        self.norm2 = TorchLayerNorm(d_model, rngs=rngs)
+        self.dropout = dropout
+        self.activation = _activation(activation)
+
+    def __call__(self, src):
+        src_batch = jnp.swapaxes(src, 0, 1)
+        src2 = self.self_attn(src_batch, src_batch, src_batch)
+        src2 = jnp.swapaxes(src2, 0, 1)
+        src = self.norm1(src + src2)
+        src2 = self.linear2(self.activation(self.linear1(src)))
+        return self.norm2(src + src2)
+
+
+class TransformerEncoder(nnx.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        activation: str,
+        num_layers: int,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.layers = nnx.List(
+            [
+                TransformerEncoderLayer(
+                    d_model,
+                    nhead,
+                    dim_feedforward,
+                    dropout,
+                    activation,
+                    rngs=rngs,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def __call__(self, src):
+        output = src
+        for layer in self.layers:
+            output = layer(output)
+        return output
+
+
+def _require_integer_timesteps(timesteps, module_name: str):
+    timesteps = jnp.asarray(timesteps)
+    if not jnp.issubdtype(timesteps.dtype, jnp.integer):
+        raise TypeError(f"{module_name} timesteps must be integer indices.")
+    return timesteps.astype(jnp.int32)
+
+
+class _DenoiserConditioningMixin:
+    def mask_cond(
+        self,
+        cond,
+        *,
+        force_mask: bool = False,
+        training: bool = False,
+        rng: Optional[jax.Array] = None,
+    ):
+        if force_mask:
+            return jnp.zeros_like(cond)
+        if training and self.cond_mask_prob > 0.0:
+            if rng is None:
+                raise ValueError("mask_cond requires rng when training with cond_mask_prob.")
+            mask = jax.random.bernoulli(
+                rng,
+                p=self.cond_mask_prob,
+                shape=(cond.shape[0], 1),
+            ).astype(cond.dtype)
+            return cond * (1.0 - mask)
+        return cond
+
+
+class DenoiserMLP(_DenoiserConditioningMixin, nnx.Module):
     def __init__(
         self,
         h_dim: int = 512,
@@ -170,27 +267,6 @@ class DenoiserMLP(nnx.Module):
             rngs=rngs,
         )
 
-    def mask_cond(
-        self,
-        cond,
-        *,
-        force_mask: bool = False,
-        training: bool = False,
-        rng: Optional[jax.Array] = None,
-    ):
-        if force_mask:
-            return jnp.zeros_like(cond)
-        if training and self.cond_mask_prob > 0.0:
-            if rng is None:
-                raise ValueError("mask_cond requires rng when training with cond_mask_prob.")
-            mask = jax.random.bernoulli(
-                rng,
-                p=self.cond_mask_prob,
-                shape=(cond.shape[0], 1),
-            ).astype(cond.dtype)
-            return cond * (1.0 - mask)
-        return cond
-
     def __call__(
         self,
         x_t,
@@ -201,10 +277,7 @@ class DenoiserMLP(nnx.Module):
         rng: Optional[jax.Array] = None,
     ):
         batch_size = x_t.shape[0]
-        timesteps = jnp.asarray(timesteps)
-        if not jnp.issubdtype(timesteps.dtype, jnp.integer):
-            raise TypeError("DenoiserMLP timesteps must be integer indices.")
-        timesteps = timesteps.astype(jnp.int32)
+        timesteps = _require_integer_timesteps(timesteps, "DenoiserMLP")
         emb_time = self.embed_timestep(timesteps)[0]
         emb_history = jnp.reshape(
             y["history_motion_normalized"],
@@ -225,6 +298,86 @@ class DenoiserMLP(nnx.Module):
         return jnp.reshape(output, (batch_size, *self.noise_shape))
 
 
+class DenoiserTransformer(_DenoiserConditioningMixin, nnx.Module):
+    def __init__(
+        self,
+        h_dim: int = 256,
+        ff_size: int = 1024,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        clip_dim: int = 512,
+        history_shape: Tuple[int, int] = (2, 276),
+        noise_shape: Tuple[int, int] = (1, 128),
+        cond_mask_prob: float = 0.0,
+        *,
+        rngs: nnx.Rngs,
+        **kwargs,
+    ):
+        self.h_dim = h_dim
+        self.ff_size = ff_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.activation = activation
+        self.history_shape = tuple(int(x) for x in history_shape)
+        self.noise_shape = tuple(int(x) for x in noise_shape)
+        self.clip_dim = clip_dim
+        self.cond_mask_prob = float(cond_mask_prob)
+
+        self.sequence_pos_encoder = PositionalEncoding(self.h_dim, self.dropout)
+        self.embed_timestep = TimestepEmbedder(
+            self.h_dim,
+            self.sequence_pos_encoder,
+            rngs=rngs,
+        )
+        self.embed_text = TorchLinear(self.clip_dim, self.h_dim, rngs=rngs)
+        self.embed_history = TorchLinear(self.history_shape[-1], self.h_dim, rngs=rngs)
+        self.embed_noise = TorchLinear(self.noise_shape[-1], self.h_dim, rngs=rngs)
+        self.seqTransEncoder = TransformerEncoder(
+            self.h_dim,
+            self.num_heads,
+            self.ff_size,
+            self.dropout,
+            self.activation,
+            self.num_layers,
+            rngs=rngs,
+        )
+        self.output_process = TorchLinear(self.h_dim, self.noise_shape[-1], rngs=rngs)
+
+    def __call__(
+        self,
+        x_t,
+        timesteps,
+        y,
+        *,
+        training: bool = False,
+        rng: Optional[jax.Array] = None,
+    ):
+        timesteps = _require_integer_timesteps(timesteps, "DenoiserTransformer")
+        emb_time = self.embed_timestep(timesteps)
+        emb_history = jnp.swapaxes(
+            self.embed_history(y["history_motion_normalized"]),
+            0,
+            1,
+        )
+        emb_text = self.embed_text(
+            self.mask_cond(
+                y["text_embedding"],
+                force_mask=bool(y.get("uncond", False)),
+                training=training,
+                rng=rng,
+            )
+        )[None, :, :]
+        emb_noise = jnp.swapaxes(self.embed_noise(x_t), 0, 1)
+        xseq = jnp.concatenate((emb_time, emb_text, emb_history, emb_noise), axis=0)
+        xseq = self.sequence_pos_encoder(xseq)
+        output = self.seqTransEncoder(xseq)[-self.noise_shape[0] :]
+        output = self.output_process(output)
+        return jnp.swapaxes(output, 0, 1)
+
+
 def _parse_shape(value: str) -> Tuple[int, ...]:
     parts = [int(part) for part in value.replace(",", " ").split()]
     if not parts:
@@ -233,11 +386,15 @@ def _parse_shape(value: str) -> Tuple[int, ...]:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Smoke test the JAX DART DenoiserMLP.")
+    parser = argparse.ArgumentParser(description="Smoke test the JAX DART denoisers.")
+    parser.add_argument("--model-type", default="mlp", choices=["mlp", "transformer"])
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--h-dim", type=int, default=512)
     parser.add_argument("--n-blocks", type=int, default=2)
+    parser.add_argument("--ff-size", type=int, default=1024)
+    parser.add_argument("--num-layers", type=int, default=8)
+    parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--activation", default="gelu")
     parser.add_argument("--clip-dim", type=int, default=512)
@@ -251,16 +408,30 @@ def main():
     from flax import nnx
 
     rng = jax.random.PRNGKey(args.seed)
-    model = DenoiserMLP(
-        h_dim=args.h_dim,
-        n_blocks=args.n_blocks,
-        dropout=args.dropout,
-        activation=args.activation,
-        clip_dim=args.clip_dim,
-        history_shape=args.history_shape,
-        noise_shape=args.noise_shape,
-        rngs=nnx.Rngs(args.seed),
-    )
+    if args.model_type == "transformer":
+        model = DenoiserTransformer(
+            h_dim=args.h_dim,
+            ff_size=args.ff_size,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            dropout=args.dropout,
+            activation=args.activation,
+            clip_dim=args.clip_dim,
+            history_shape=args.history_shape,
+            noise_shape=args.noise_shape,
+            rngs=nnx.Rngs(args.seed),
+        )
+    else:
+        model = DenoiserMLP(
+            h_dim=args.h_dim,
+            n_blocks=args.n_blocks,
+            dropout=args.dropout,
+            activation=args.activation,
+            clip_dim=args.clip_dim,
+            history_shape=args.history_shape,
+            noise_shape=args.noise_shape,
+            rngs=nnx.Rngs(args.seed),
+        )
     data_keys = jax.random.split(rng, 3)
     x_t = jax.random.normal(data_keys[0], (args.batch_size, *args.noise_shape))
     history = jax.random.normal(data_keys[1], (args.batch_size, *args.history_shape))

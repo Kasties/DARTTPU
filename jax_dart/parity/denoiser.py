@@ -1,4 +1,4 @@
-"""Compare Torch and JAX DART DenoiserMLP plus diffusion ``q_sample``."""
+"""Compare Torch and JAX DART denoisers plus diffusion ``q_sample``."""
 
 from __future__ import annotations
 
@@ -54,18 +54,53 @@ def _copy_linear(torch_state: Dict[str, Any], prefix: str, jax_linear) -> None:
     _assign_nnx_value(jax_linear.bias, _as_numpy(torch_state[f"{prefix}.bias"]))
 
 
+def _copy_layer_norm(torch_state: Dict[str, Any], prefix: str, jax_norm) -> None:
+    _assign_nnx_value(jax_norm.weight, _as_numpy(torch_state[f"{prefix}.weight"]))
+    _assign_nnx_value(jax_norm.bias, _as_numpy(torch_state[f"{prefix}.bias"]))
+
+
+def _copy_mha(torch_state: Dict[str, Any], prefix: str, jax_mha) -> None:
+    _assign_nnx_value(
+        jax_mha.in_proj_weight,
+        _as_numpy(torch_state[f"{prefix}.in_proj_weight"]),
+    )
+    _assign_nnx_value(
+        jax_mha.in_proj_bias,
+        _as_numpy(torch_state[f"{prefix}.in_proj_bias"]),
+    )
+    _assign_nnx_value(
+        jax_mha.out_proj_weight,
+        _as_numpy(torch_state[f"{prefix}.out_proj.weight"]),
+    )
+    _assign_nnx_value(
+        jax_mha.out_proj_bias,
+        _as_numpy(torch_state[f"{prefix}.out_proj.bias"]),
+    )
+
+
 def copy_torch_denoiser_to_jax(torch_model, jax_model) -> None:
     copy_torch_state_to_jax(torch_model.state_dict(), jax_model)
 
 
 def copy_torch_state_to_jax(torch_state: Dict[str, Any], jax_model) -> None:
-    """Copy Torch ``model.mld_denoiser.DenoiserMLP`` state into the JAX port."""
+    """Copy Torch ``model.mld_denoiser`` state into the matching JAX port."""
+    if hasattr(jax_model, "seqTransEncoder"):
+        _copy_transformer_state_to_jax(torch_state, jax_model)
+    else:
+        _copy_mlp_state_to_jax(torch_state, jax_model)
+
+
+def _copy_shared_timestep_state(torch_state: Dict[str, Any], jax_model) -> None:
     pe_key = "sequence_pos_encoder.pe"
     if pe_key not in torch_state:
         pe_key = "embed_timestep.sequence_pos_encoder.pe"
     _assign_nnx_value(jax_model.sequence_pos_encoder.pe, _as_numpy(torch_state[pe_key]))
     _copy_linear(torch_state, "embed_timestep.time_embed.0", jax_model.embed_timestep.time_embed[0])
     _copy_linear(torch_state, "embed_timestep.time_embed.2", jax_model.embed_timestep.time_embed[1])
+
+
+def _copy_mlp_state_to_jax(torch_state: Dict[str, Any], jax_model) -> None:
+    _copy_shared_timestep_state(torch_state, jax_model)
     _copy_linear(torch_state, "input_project", jax_model.input_project)
     for block_index, block in enumerate(jax_model.mlp.layers):
         for layer_index, linear in enumerate(block.layers):
@@ -75,6 +110,28 @@ def copy_torch_state_to_jax(torch_state: Dict[str, Any], jax_model) -> None:
                 linear,
             )
     _copy_linear(torch_state, "mlp.out_fc", jax_model.mlp.out_fc)
+
+
+def _copy_transformer_layer(torch_state: Dict[str, Any], prefix: str, jax_layer) -> None:
+    _copy_mha(torch_state, f"{prefix}.self_attn", jax_layer.self_attn)
+    _copy_linear(torch_state, f"{prefix}.linear1", jax_layer.linear1)
+    _copy_linear(torch_state, f"{prefix}.linear2", jax_layer.linear2)
+    _copy_layer_norm(torch_state, f"{prefix}.norm1", jax_layer.norm1)
+    _copy_layer_norm(torch_state, f"{prefix}.norm2", jax_layer.norm2)
+
+
+def _copy_transformer_state_to_jax(torch_state: Dict[str, Any], jax_model) -> None:
+    _copy_shared_timestep_state(torch_state, jax_model)
+    _copy_linear(torch_state, "embed_text", jax_model.embed_text)
+    _copy_linear(torch_state, "embed_history", jax_model.embed_history)
+    _copy_linear(torch_state, "embed_noise", jax_model.embed_noise)
+    for index, layer in enumerate(jax_model.seqTransEncoder.layers):
+        _copy_transformer_layer(
+            torch_state,
+            f"seqTransEncoder.layers.{index}",
+            layer,
+        )
+    _copy_linear(torch_state, "output_process", jax_model.output_process)
 
 
 def _extract_model_state(checkpoint: Any) -> Dict[str, Any]:
@@ -166,8 +223,12 @@ def _config_from_args(
     metadata: Optional[dict] = None,
 ) -> Dict[str, Any]:
     config = {
+        "model_type": args.model_type,
         "h_dim": int(args.h_dim),
         "n_blocks": int(args.n_blocks),
+        "ff_size": int(args.ff_size),
+        "num_layers": int(args.num_layers),
+        "num_heads": int(args.num_heads),
         "dropout": float(args.dropout),
         "activation": args.activation,
         "cond_mask_prob": float(args.cond_mask_prob),
@@ -400,7 +461,7 @@ def _maybe_fail(compared: Dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Torch/JAX DART DenoiserMLP parity on one batch."
+        description="Run Torch/JAX DART denoiser parity on one batch."
     )
     parser.add_argument(
         "--mode",
@@ -413,10 +474,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--torch-device", default=None, help="Defaults to cuda when available, otherwise cpu.")
-    parser.add_argument("--checkpoint", default=None, help="Optional DART DenoiserMLP .pt checkpoint to load.")
+    parser.add_argument("--checkpoint", default=None, help="Optional DART denoiser .pt checkpoint to load.")
     parser.add_argument("--snapshot", default=None, help="Torch-exported snapshot for --mode jax-compare.")
+    parser.add_argument("--model-type", default="mlp", choices=["mlp", "transformer"])
     parser.add_argument("--h-dim", type=int, default=512)
     parser.add_argument("--n-blocks", type=int, default=2)
+    parser.add_argument("--ff-size", type=int, default=1024)
+    parser.add_argument("--num-layers", type=int, default=8)
+    parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--activation", default="gelu", choices=["tanh", "relu", "sigmoid", "gelu", "lrelu"])
     parser.add_argument("--cond-mask-prob", type=float, default=0.0)
@@ -454,17 +519,32 @@ def _require(value: Optional[str], message: str) -> str:
 
 def _make_torch_model(config: Dict[str, Any], device: str, checkpoint: Optional[str] = None):
     from model.mld_denoiser import DenoiserMLP as TorchDenoiserMLP
+    from model.mld_denoiser import DenoiserTransformer as TorchDenoiserTransformer
 
-    torch_model = TorchDenoiserMLP(
-        h_dim=int(config["h_dim"]),
-        n_blocks=int(config["n_blocks"]),
-        dropout=float(config["dropout"]),
-        activation=config["activation"],
-        clip_dim=int(config["clip_dim"]),
-        history_shape=tuple(config["history_shape"]),
-        noise_shape=tuple(config["noise_shape"]),
-        cond_mask_prob=float(config["cond_mask_prob"]),
-    ).to(device)
+    if config.get("model_type", "mlp") == "transformer":
+        torch_model = TorchDenoiserTransformer(
+            h_dim=int(config["h_dim"]),
+            ff_size=int(config["ff_size"]),
+            num_layers=int(config["num_layers"]),
+            num_heads=int(config["num_heads"]),
+            dropout=float(config["dropout"]),
+            activation=config["activation"],
+            clip_dim=int(config["clip_dim"]),
+            history_shape=tuple(config["history_shape"]),
+            noise_shape=tuple(config["noise_shape"]),
+            cond_mask_prob=float(config["cond_mask_prob"]),
+        ).to(device)
+    else:
+        torch_model = TorchDenoiserMLP(
+            h_dim=int(config["h_dim"]),
+            n_blocks=int(config["n_blocks"]),
+            dropout=float(config["dropout"]),
+            activation=config["activation"],
+            clip_dim=int(config["clip_dim"]),
+            history_shape=tuple(config["history_shape"]),
+            noise_shape=tuple(config["noise_shape"]),
+            cond_mask_prob=float(config["cond_mask_prob"]),
+        ).to(device)
     if checkpoint is not None:
         load_torch_checkpoint(torch_model, checkpoint, device)
     return torch_model
@@ -491,7 +571,22 @@ def _make_jax_model(config: Dict[str, Any]):
     from flax import nnx
 
     from jax_dart.models.mld_denoiser import DenoiserMLP as JaxDenoiserMLP
+    from jax_dart.models.mld_denoiser import DenoiserTransformer as JaxDenoiserTransformer
 
+    if config.get("model_type", "mlp") == "transformer":
+        return JaxDenoiserTransformer(
+            h_dim=int(config["h_dim"]),
+            ff_size=int(config["ff_size"]),
+            num_layers=int(config["num_layers"]),
+            num_heads=int(config["num_heads"]),
+            dropout=float(config["dropout"]),
+            activation=config["activation"],
+            clip_dim=int(config["clip_dim"]),
+            history_shape=tuple(config["history_shape"]),
+            noise_shape=tuple(config["noise_shape"]),
+            cond_mask_prob=float(config["cond_mask_prob"]),
+            rngs=nnx.Rngs(int(config["seed"])),
+        )
     return JaxDenoiserMLP(
         h_dim=int(config["h_dim"]),
         n_blocks=int(config["n_blocks"]),

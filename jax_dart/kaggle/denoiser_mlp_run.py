@@ -1,4 +1,4 @@
-"""Notebook-friendly entrypoint for JAX DenoiserMLP TPU checks.
+"""Notebook-friendly entrypoint for JAX denoiser TPU checks.
 
 This wrapper is designed for Kaggle cells such as:
 
@@ -27,7 +27,7 @@ def _ensure_repo_on_path() -> Path:
 
 def _parse_wrapper_args(argv: List[str]):
     parser = argparse.ArgumentParser(
-        description="Kaggle TPU wrapper for JAX DenoiserMLP checks.",
+        description="Kaggle TPU wrapper for JAX denoiser checks.",
         add_help=False,
     )
     parser.add_argument(
