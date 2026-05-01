@@ -44,6 +44,29 @@ def load_shard(path: str) -> ArrayDict:
         return {key: data[key] for key in data.files}
 
 
+def load_text_embedding_table(root: str) -> Optional[np.ndarray]:
+    path = Path(root) / "text_embeddings.npz"
+    if not path.exists():
+        return None
+    with np.load(path) as data:
+        return data["embeddings"].astype(np.float32, copy=False)
+
+
+def text_embeddings_for_batch(
+    batch: ArrayDict,
+    *,
+    text_embedding_table: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    if "text_embedding" in batch:
+        return batch["text_embedding"].astype(np.float32, copy=False)
+    if "text_id" in batch and text_embedding_table is not None:
+        return text_embedding_table[batch["text_id"]].astype(np.float32, copy=False)
+    raise KeyError(
+        "Denoiser training requires text embeddings. Export shards with "
+        "--text-mode inline, or --text-mode ids plus text_embeddings.npz."
+    )
+
+
 def split_motion_to_vae(
     motion: np.ndarray,
     history_length: int,
