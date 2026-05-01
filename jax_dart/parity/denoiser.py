@@ -177,6 +177,50 @@ def _load_torch_state_np(snapshot: Dict[str, np.ndarray]) -> ArrayMap:
     }
 
 
+def _infer_model_type_from_state(torch_state: ArrayMap) -> Optional[str]:
+    if "seqTransEncoder.layers.0.self_attn.in_proj_weight" in torch_state:
+        return "transformer"
+    if "embed_text.weight" in torch_state and "output_process.weight" in torch_state:
+        return "transformer"
+    if "input_project.weight" in torch_state:
+        return "mlp"
+    return None
+
+
+def _infer_transformer_num_layers(torch_state: ArrayMap) -> Optional[int]:
+    layer_indices = []
+    prefix = "seqTransEncoder.layers."
+    suffix = ".self_attn.in_proj_weight"
+    for key in torch_state:
+        if key.startswith(prefix) and key.endswith(suffix):
+            layer = key[len(prefix) : -len(suffix)]
+            if layer.isdigit():
+                layer_indices.append(int(layer))
+    if not layer_indices:
+        return None
+    return max(layer_indices) + 1
+
+
+def _normalize_config_from_state(config: Dict[str, Any], torch_state: ArrayMap) -> Dict[str, Any]:
+    config = dict(config)
+    state_model_type = _infer_model_type_from_state(torch_state)
+    if state_model_type is not None and config.get("model_type", "mlp") != state_model_type:
+        print(
+            "snapshot config model_type",
+            repr(config.get("model_type")),
+            "does not match state; using",
+            repr(state_model_type),
+        )
+        config["model_type"] = state_model_type
+    if config.get("model_type") == "transformer":
+        config.setdefault("ff_size", 1024)
+        config.setdefault("num_heads", 4)
+        inferred_layers = _infer_transformer_num_layers(torch_state)
+        if inferred_layers is not None:
+            config.setdefault("num_layers", inferred_layers)
+    return config
+
+
 def _load_config(snapshot: Dict[str, np.ndarray]) -> Dict[str, Any]:
     raw = snapshot["config_json"]
     return json.loads(str(raw.tolist()))
@@ -660,6 +704,7 @@ def run_jax_compare(args: argparse.Namespace) -> None:
     torch_state = _load_torch_state_np(snapshot)
     if not torch_state:
         raise SystemExit(f"{snapshot_path} does not contain Torch state arrays.")
+    config = _normalize_config_from_state(config, torch_state)
     jax_model = _make_jax_model(config)
     copy_torch_state_to_jax(torch_state, jax_model)
     jax_outputs = deterministic_jax_forward(
