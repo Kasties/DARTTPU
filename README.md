@@ -6,6 +6,8 @@
 
 https://github.com/user-attachments/assets/b26e95e7-4af0-4548-bdca-8f361594951c
 
+#TPU (Jax version)
+This project aims to port DartControl to TPUs for training
 
 
 # Updates
